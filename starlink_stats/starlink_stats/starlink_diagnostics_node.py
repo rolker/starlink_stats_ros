@@ -56,8 +56,8 @@ class StarlinkDiagnosticsNode(Node):
     def query_dish(self):
         """Query the Starlink dish via gRPC and return status as a dict."""
         try:
-            from spacex.api.device import device_pb2
-            from spacex.api.device import device_pb2_grpc
+            from spacex_api.device import device_pb2
+            from spacex_api.device import device_pb2_grpc
         except ModuleNotFoundError:
             return {
                 'Starlink': {
@@ -86,6 +86,18 @@ class StarlinkDiagnosticsNode(Node):
             including_default_value_fields=True,
         )
 
+    def _check_alerts(self, status_dict):
+        """Derive diagnostic level from the alerts sub-dict."""
+        alerts = status_dict.get('alerts', {})
+        if not isinstance(alerts, dict):
+            return DiagnosticStatus.OK
+        active = [k for k, v in alerts.items() if v]
+        if 'thermal_shutdown' in active:
+            return DiagnosticStatus.ERROR
+        if active:
+            return DiagnosticStatus.WARN
+        return DiagnosticStatus.OK
+
     def timer_callback(self):
         diag_array = DiagnosticArray()
         diag_array.header.stamp = self.get_clock().now().to_msg()
@@ -94,26 +106,22 @@ class StarlinkDiagnosticsNode(Node):
             diagnostic_data = self.query_dish()
 
             for key, value in diagnostic_data.items():
-                if not isinstance(value, MutableMapping):
+                if not isinstance(value, dict):
                     continue
 
                 diag_status = DiagnosticStatus()
-                diag_status.name = 'Starlink'
+                diag_status.name = f'Starlink: {key}'
                 diag_status.hardware_id = str(
                     value.get('device_info', {}).get('id', '')
                 )
-                diag_status.message = str(value.get('message', ''))
-                diag_status.level = int(
-                    value.get('level', DiagnosticStatus.OK)
-                )
+                diag_status.level = self._check_alerts(value)
 
                 flat = flatten(value)
                 for k, v in flat.items():
-                    if k not in ('level', 'message'):
-                        kv = KeyValue()
-                        kv.key = k
-                        kv.value = str(v)
-                        diag_status.values.append(kv)
+                    kv = KeyValue()
+                    kv.key = k
+                    kv.value = str(v)
+                    diag_status.values.append(kv)
 
                 diag_array.status.append(diag_status)
 
