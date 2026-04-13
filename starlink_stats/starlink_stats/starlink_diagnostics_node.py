@@ -46,6 +46,11 @@ class StarlinkDiagnosticsNode(Node):
         poll_rate = self.get_parameter('poll_rate').value
 
         self.pub = self.create_publisher(DiagnosticArray, '/diagnostics', 10)
+
+        self.channel = None
+        self.stub = None
+        self._connect()
+
         self.timer = self.create_timer(1.0 / poll_rate, self.timer_callback)
 
         self.get_logger().info(
@@ -53,12 +58,20 @@ class StarlinkDiagnosticsNode(Node):
             f'at {poll_rate} Hz'
         )
 
+    def _connect(self):
+        """Create or recreate the gRPC channel and stub."""
+        if self.channel is not None:
+            self.channel.close()
+        self.channel = grpc.insecure_channel(self.dish_address)
+        try:
+            from spacex_api.device import device_pb2_grpc
+            self.stub = device_pb2_grpc.DeviceStub(self.channel)
+        except ModuleNotFoundError:
+            self.stub = None
+
     def query_dish(self):
         """Query the Starlink dish via gRPC and return status as a dict."""
-        try:
-            from spacex_api.device import device_pb2
-            from spacex_api.device import device_pb2_grpc
-        except ModuleNotFoundError:
+        if self.stub is None:
             return {
                 'Starlink': {
                     'level': DiagnosticStatus.ERROR,
@@ -67,12 +80,12 @@ class StarlinkDiagnosticsNode(Node):
             }
 
         try:
-            with grpc.insecure_channel(self.dish_address) as channel:
-                stub = device_pb2_grpc.DeviceStub(channel)
-                response = stub.Handle(
-                    device_pb2.Request(get_status={}), timeout=10
-                )
+            from spacex_api.device import device_pb2
+            response = self.stub.Handle(
+                device_pb2.Request(get_status={}), timeout=10
+            )
         except grpc.RpcError as e:
+            self._connect()
             return {
                 'Starlink': {
                     'level': DiagnosticStatus.ERROR,
@@ -140,6 +153,12 @@ class StarlinkDiagnosticsNode(Node):
             self.get_logger().warning(
                 f'Failed to get Starlink diagnostics: {e}'
             )
+
+    def destroy_node(self):
+        """Close gRPC channel before destroying the node."""
+        if self.channel is not None:
+            self.channel.close()
+        super().destroy_node()
 
 
 def main(args=None):
