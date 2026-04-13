@@ -22,12 +22,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PKG_DIR="$(dirname "$SCRIPT_DIR")"
 STUB_DIR="$PKG_DIR/spacex_api"
 VENV_DIR=""
+PROTOSET_DIR=""
+PROTO_OUT=""
 
 cleanup() {
-    if [ -n "$VENV_DIR" ] && [ -d "$VENV_DIR" ]; then
-        echo "Cleaning up temporary venv..."
-        rm -rf "$VENV_DIR"
-    fi
+    for d in "$VENV_DIR" "$PROTOSET_DIR" "$PROTO_OUT"; do
+        if [ -n "$d" ] && [ -d "$d" ]; then
+            rm -rf "$d"
+        fi
+    done
 }
 trap cleanup EXIT
 
@@ -85,7 +88,6 @@ PYEOF
 PROTOSET_FILE="$PROTOSET_DIR/starlink.protoset"
 if [ ! -f "$PROTOSET_FILE" ]; then
     echo "Error: Failed to fetch protoset from dish." >&2
-    rm -rf "$PROTOSET_DIR"
     exit 1
 fi
 

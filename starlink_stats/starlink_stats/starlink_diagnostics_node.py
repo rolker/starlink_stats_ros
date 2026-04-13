@@ -109,6 +109,15 @@ class StarlinkDiagnosticsNode(Node):
                 if not isinstance(value, dict):
                     continue
 
+                # Error dicts from query_dish() contain 'level' and 'message'
+                if 'level' in value and 'message' in value:
+                    diag_status = DiagnosticStatus()
+                    diag_status.name = 'Starlink'
+                    diag_status.level = int(value['level'])
+                    diag_status.message = str(value['message'])
+                    diag_array.status.append(diag_status)
+                    continue
+
                 diag_status = DiagnosticStatus()
                 diag_status.name = f'Starlink: {key}'
                 diag_status.hardware_id = str(
