@@ -41,9 +41,11 @@ class StarlinkDiagnosticsNode(Node):
 
         self.declare_parameter('dish_address', '192.168.100.1:9200')
         self.declare_parameter('poll_rate', 1.0)
+        self.declare_parameter('hardware_id', '')
 
         self.dish_address = self.get_parameter('dish_address').value
         poll_rate = self.get_parameter('poll_rate').value
+        self.hardware_id = self.get_parameter('hardware_id').value
 
         self.pub = self.create_publisher(DiagnosticArray, '/diagnostics', 10)
 
@@ -53,9 +55,15 @@ class StarlinkDiagnosticsNode(Node):
 
         self.timer = self.create_timer(1.0 / poll_rate, self.timer_callback)
 
+        self._name_prefix = (
+            f'Starlink: {self.hardware_id}' if self.hardware_id
+            else 'Starlink'
+        )
+
         self.get_logger().info(
             f'Starlink diagnostics node started, polling {self.dish_address} '
             f'at {poll_rate} Hz'
+            + (f' (hardware_id: {self.hardware_id})' if self.hardware_id else '')
         )
 
     def _connect(self):
@@ -125,16 +133,18 @@ class StarlinkDiagnosticsNode(Node):
                 # Error dicts from query_dish() contain 'level' and 'message'
                 if 'level' in value and 'message' in value:
                     diag_status = DiagnosticStatus()
-                    diag_status.name = 'Starlink'
+                    diag_status.name = self._name_prefix
+                    diag_status.hardware_id = self.hardware_id
                     diag_status.level = int(value['level'])
                     diag_status.message = str(value['message'])
                     diag_array.status.append(diag_status)
                     continue
 
                 diag_status = DiagnosticStatus()
-                diag_status.name = f'Starlink: {key}'
-                diag_status.hardware_id = str(
-                    value.get('device_info', {}).get('id', '')
+                diag_status.name = f'{self._name_prefix}: {key}'
+                diag_status.hardware_id = (
+                    self.hardware_id
+                    or str(value.get('device_info', {}).get('id', ''))
                 )
                 diag_status.level = self._check_alerts(value)
 
