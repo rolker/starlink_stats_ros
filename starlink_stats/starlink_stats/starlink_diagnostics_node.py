@@ -157,7 +157,13 @@ class StarlinkDiagnosticsNode(Node):
             f'Starlink: {self.hardware_id}' if self.hardware_id else 'Starlink'
         )
         self._updater = diagnostic_updater.Updater(self, period=1.0)
-        self._updater.setHardwareID(self.hardware_id if self.hardware_id else 'none')
+        # If hardware_id was provided, use it as-is. Otherwise leave the
+        # hardware ID empty for now and update it from the dish's
+        # ``device_info.id`` after the first successful poll (see
+        # ``_task_comms``). This preserves the pre-PR behavior of surfacing
+        # the dish-reported ID in DiagnosticStatus.hardware_id.
+        self._updater.setHardwareID(self.hardware_id if self.hardware_id else '')
+        self._dish_hwid_applied = bool(self.hardware_id)
         self._updater.add(f'{self._name_prefix}: comms', self._task_comms)
         self._updater.add(f'{self._name_prefix}: state', self._task_state)
         self._updater.add(f'{self._name_prefix}: link', self._task_link)
@@ -338,17 +344,25 @@ class StarlinkDiagnosticsNode(Node):
         return age is None or age > self.thresholds.stale_timeout_sec
 
     def _apply_common_kv(self, stat, cache: 'CachedStatus', task_name: str):
-        """Append shared KeyValues: last_query_time and either curated or dumped fields."""
+        """
+        Append shared KeyValues: last_query_time, curated fields, and optional dump.
+
+        Curated fields are always emitted so dashboards relying on the stable
+        allowlist keep working. When ``dump_all_fields`` is true the full
+        flattened response is appended after — no key collisions because the
+        dump uses underscore-joined paths (``a_b_c``) while curated keys are
+        dotted (``a.b.c``). This matches the spec in #4: the dump is included
+        *in addition to* the curated keys, not in place of them.
+        """
         stat.add('last_query_time', cache.poll_wall_iso or 'never')
-        if self.dump_all_fields and cache.response is not None:
-            for k, v in flatten(cache.response).items():
-                stat.add(k, str(v))
-            return
         status = cache.status or {}
         for path in CURATED_KEYS.get(task_name, []):
             val = get_dotted(status, path)
             if val is not None:
                 stat.add(path, str(val))
+        if self.dump_all_fields and cache.response is not None:
+            for k, v in flatten(cache.response).items():
+                stat.add(k, str(v))
 
     def _short_circuit_stale(self, stat, cache: 'CachedStatus', task_name: str) -> bool:
         """
@@ -384,6 +398,15 @@ class StarlinkDiagnosticsNode(Node):
         """Report gRPC reachability, last-query age, and reconnect state."""
         cache = self._cache  # snapshot
         now_mono = time.monotonic()
+        # First-poll hardware ID: when the user did not pass an explicit
+        # hardware_id, adopt the dish's reported device_info.id once available
+        # so DiagnosticStatus.hardware_id distinguishes multiple dishes. Done
+        # here on the rclpy thread to avoid racing the gRPC worker.
+        if not self._dish_hwid_applied and cache.status is not None:
+            dish_id = get_dotted(cache.status, 'device_info.id')
+            if dish_id:
+                self._updater.setHardwareID(str(dish_id))
+                self._dish_hwid_applied = True
         if cache.error_message:
             # Most recent poll attempt failed. Surface the error here; the
             # other tasks continue to read the last-known status from the

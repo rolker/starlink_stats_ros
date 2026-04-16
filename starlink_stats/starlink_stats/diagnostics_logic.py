@@ -7,8 +7,10 @@
 """
 Pure-Python diagnostic logic for the Starlink node.
 
-This module is kept free of ROS 2 runtime and gRPC imports so it can be
-unit-tested against hand-built status dicts.
+This module avoids heavy ROS 2 runtime dependencies (``rclpy``) and gRPC
+imports so it can be unit-tested against hand-built status dicts. It still
+imports ``diagnostic_msgs.msg.DiagnosticStatus`` for the standard diagnostic
+level constants (OK / WARN / ERROR / STALE).
 """
 
 from __future__ import annotations
