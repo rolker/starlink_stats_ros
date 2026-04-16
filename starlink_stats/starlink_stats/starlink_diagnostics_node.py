@@ -16,8 +16,10 @@ out due to a slow or hung gRPC call. Staleness is reported in-band via
 
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import threading
 import time
 from typing import Optional
 
@@ -97,7 +99,10 @@ class StarlinkDiagnosticsNode(Node):
         poll_rate = float(self.get_parameter('poll_rate').value)
         self.hardware_id = self.get_parameter('hardware_id').value
         self.grpc_timeout_sec = float(self.get_parameter('grpc_timeout_sec').value)
-        self.dump_all_fields = bool(self.get_parameter('dump_all_fields').value)
+        # Parameter is declared with a bool default, so rclpy enforces the
+        # type. No bool() cast here because bool('false') == True would be
+        # a silent bug if a non-bool value ever slipped through.
+        self.dump_all_fields = self.get_parameter('dump_all_fields').value
 
         def _p(name: str) -> float:
             return float(self.get_parameter(name).value)
@@ -114,7 +119,11 @@ class StarlinkDiagnosticsNode(Node):
             stale_timeout_sec=_p('stale_timeout_sec'),
         )
 
-        # Cached state + gRPC bookkeeping
+        # Cached state + gRPC bookkeeping.
+        # self._cache is replaced atomically (whole-dataclass swap) from the
+        # worker thread so task callbacks on the rclpy thread only ever see a
+        # consistent snapshot. Task callbacks should take a local reference
+        # at entry and not re-read self._cache during one update.
         self._cache = CachedStatus()
         self._channel = None
         self._stub = None
@@ -123,6 +132,16 @@ class StarlinkDiagnosticsNode(Node):
         self._next_reconnect_monotonic = 0.0
         self._unknown_states_seen: set[str] = set()
         self._unknown_alerts_seen: set[str] = set()
+
+        # gRPC runs on a single-worker background thread so a slow or hung
+        # call never blocks the rclpy executor (and therefore the Updater's
+        # publish timer). The in-flight flag and lock prevent queueing up
+        # polls if the dish is slower than the poll period.
+        self._grpc_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix='starlink-grpc'
+        )
+        self._poll_lock = threading.Lock()
+        self._poll_in_flight = False
 
         # Updater — steady 1 Hz publishing decoupled from polling.
         self._name_prefix = (
@@ -173,87 +192,128 @@ class StarlinkDiagnosticsNode(Node):
     # --- Poll cycle ---
 
     def _poll_callback(self):
-        """Query dish and update cache. Never blocks the Updater."""
+        """Kick off a background gRPC poll. Runs on the rclpy executor thread."""
         now_mono = time.monotonic()
 
         if not _HAS_SPACEX_API:
-            self._cache.error_message = 'spacex_api protobuf modules not found'
-            self._cache.status = None
+            # Atomic cache swap; preserve SEARCHING tracking from prior state.
+            prev = self._cache
+            self._cache = CachedStatus(
+                poll_monotonic=prev.poll_monotonic,
+                poll_wall_iso=prev.poll_wall_iso,
+                error_message='spacex_api protobuf modules not found',
+                first_searching_monotonic=prev.first_searching_monotonic,
+            )
             return
 
         # Respect backoff window after a failure.
         if self._reconnect_attempts > 0 and now_mono < self._next_reconnect_monotonic:
             return
 
-        try:
-            response = self._stub.Handle(
-                device_pb2.Request(get_status={}),
-                timeout=self.grpc_timeout_sec,
-            )
-        except grpc.RpcError as e:
-            code_name = 'unknown'
-            if hasattr(e, 'code') and callable(e.code):
-                code = e.code()
-                if code is not None:
-                    code_name = code.name
-            self._cache.error_message = f'dish unreachable ({code_name})'
-            self._cache.status = None
-            self._schedule_reconnect(now_mono)
-            # Recreate channel for the next attempt (after backoff expires).
-            try:
-                self._connect()
-            except Exception as ex:  # pragma: no cover - grpc internals
-                self.get_logger().warning(f'reconnect failed: {ex}')
-            return
+        # Claim the in-flight slot; skip this tick if a previous query is
+        # still running (e.g. dish is slow and poll_rate is faster than response).
+        with self._poll_lock:
+            if self._poll_in_flight:
+                return
+            self._poll_in_flight = True
 
+        future = self._grpc_executor.submit(self._blocking_query)
+        future.add_done_callback(self._handle_poll_result)
+
+    def _blocking_query(self) -> tuple[dict, float, str]:
+        """Run on the gRPC worker thread; returns parsed response + timestamps."""
+        response = self._stub.Handle(
+            device_pb2.Request(get_status={}),
+            timeout=self.grpc_timeout_sec,
+        )
         full = MessageToDict(
             response,
             preserving_proto_field_name=True,
             including_default_value_fields=True,
         )
-        status = full.get(DISH_GET_STATUS_KEY)
-        if not isinstance(status, dict):
-            # Unexpected oneof - fall back to the full response so downstream
-            # tasks still have something to look at.
-            status = full
+        now_mono = time.monotonic()
+        now_iso = datetime.now(timezone.utc).isoformat(timespec='seconds')
+        return full, now_mono, now_iso
 
-        self._cache.status = status
-        self._cache.response = full
-        self._cache.poll_monotonic = now_mono
-        self._cache.poll_wall_iso = datetime.now(timezone.utc).isoformat(timespec='seconds')
-        self._cache.error_message = None
+    def _handle_poll_result(self, future: Future):
+        """Done-callback on the gRPC worker thread. Swaps the cache atomically."""
+        try:
+            try:
+                full, now_mono, now_iso = future.result()
+            except grpc.RpcError as e:
+                code_name = 'unknown'
+                if hasattr(e, 'code') and callable(e.code):
+                    code = e.code()
+                    if code is not None:
+                        code_name = code.name
+                prev = self._cache
+                self._cache = CachedStatus(
+                    poll_monotonic=prev.poll_monotonic,
+                    poll_wall_iso=prev.poll_wall_iso,
+                    error_message=f'dish unreachable ({code_name})',
+                    first_searching_monotonic=prev.first_searching_monotonic,
+                )
+                self._schedule_reconnect(time.monotonic())
+                try:
+                    self._connect()
+                except Exception as ex:  # pragma: no cover - grpc internals
+                    self.get_logger().warning(f'reconnect failed: {ex}')
+                return
+            except Exception as ex:  # pragma: no cover - unexpected
+                self.get_logger().warning(f'poll handler error: {ex}')
+                return
 
-        # Track SEARCHING entry so the link task can apply the grace window.
-        state = status.get('state') if isinstance(status, dict) else None
-        if state == 'SEARCHING':
-            if self._cache.first_searching_monotonic is None:
-                self._cache.first_searching_monotonic = now_mono
-        else:
-            self._cache.first_searching_monotonic = None
+            status = full.get(DISH_GET_STATUS_KEY)
+            if not isinstance(status, dict):
+                # Unexpected oneof - fall back to the full response so
+                # downstream tasks still have something to look at.
+                status = full
 
-        # Reset backoff on success.
-        self._reconnect_attempts = 0
-        self._reconnect_backoff_sec = 0.0
+            state = status.get('state') if isinstance(status, dict) else None
+            prev = self._cache
+            if state == 'SEARCHING':
+                first_search = prev.first_searching_monotonic or now_mono
+            else:
+                first_search = None
+
+            self._cache = CachedStatus(
+                status=status,
+                response=full,
+                poll_monotonic=now_mono,
+                poll_wall_iso=now_iso,
+                error_message=None,
+                first_searching_monotonic=first_search,
+            )
+            self._reconnect_attempts = 0
+            self._reconnect_backoff_sec = 0.0
+        finally:
+            with self._poll_lock:
+                self._poll_in_flight = False
 
     # --- Updater task helpers ---
+    #
+    # Tasks take a local snapshot (`cache = self._cache`) and pass it through
+    # the helpers below so that an atomic swap mid-update (from the worker
+    # thread) cannot produce a torn view of the status.
 
-    def _data_age(self, now_mono: float) -> Optional[float]:
-        if self._cache.poll_monotonic <= 0.0:
+    @staticmethod
+    def _data_age(cache: 'CachedStatus', now_mono: float) -> Optional[float]:
+        if cache.poll_monotonic <= 0.0:
             return None
-        return now_mono - self._cache.poll_monotonic
+        return now_mono - cache.poll_monotonic
 
-    def _is_stale(self, now_mono: float) -> bool:
-        age = self._data_age(now_mono)
+    def _is_stale(self, cache: 'CachedStatus', now_mono: float) -> bool:
+        age = self._data_age(cache, now_mono)
         return age is None or age > self.thresholds.stale_timeout_sec
 
-    def _apply_common_kv(self, stat, task_name: str):
+    def _apply_common_kv(self, stat, cache: 'CachedStatus', task_name: str):
         """Append shared KeyValues: last_query_time and either curated or dumped fields."""
-        stat.add('last_query_time', self._cache.poll_wall_iso or 'never')
-        if self.dump_all_fields and self._cache.response is not None:
-            for k, v in flatten(self._cache.response).items():
+        stat.add('last_query_time', cache.poll_wall_iso or 'never')
+        if self.dump_all_fields and cache.response is not None:
+            for k, v in flatten(cache.response).items():
                 stat.add(k, str(v))
             return
-        status = self._cache.status or {}
+        status = cache.status or {}
         for path in CURATED_KEYS.get(task_name, []):
             val = get_dotted(status, path)
             if val is not None:
@@ -263,35 +323,37 @@ class StarlinkDiagnosticsNode(Node):
 
     def _task_comms(self, stat):
         """Report gRPC reachability, last-query age, and reconnect state."""
+        cache = self._cache  # snapshot
         now_mono = time.monotonic()
-        if self._cache.error_message and self._cache.status is None:
-            stat.summary(DiagnosticStatus.ERROR, self._cache.error_message)
-        elif self._cache.status is None:
+        if cache.error_message and cache.status is None:
+            stat.summary(DiagnosticStatus.ERROR, cache.error_message)
+        elif cache.status is None:
             stat.summary(DiagnosticStatus.STALE, 'no successful poll yet')
-        elif self._is_stale(now_mono):
-            age = self._data_age(now_mono) or 0.0
+        elif self._is_stale(cache, now_mono):
+            age = self._data_age(cache, now_mono) or 0.0
             stat.summary(
                 DiagnosticStatus.STALE,
                 f'no response for {age:.1f}s '
                 f'(stale_timeout_sec={self.thresholds.stale_timeout_sec})',
             )
         else:
-            age = self._data_age(now_mono) or 0.0
+            age = self._data_age(cache, now_mono) or 0.0
             stat.summary(DiagnosticStatus.OK, f'dish reachable ({age:.1f}s ago)')
 
-        self._apply_common_kv(stat, 'comms')
+        self._apply_common_kv(stat, cache, 'comms')
         if self._reconnect_attempts > 0:
             stat.add('reconnect_attempts', str(self._reconnect_attempts))
             stat.add('reconnect_backoff_sec', f'{self._reconnect_backoff_sec:.1f}')
         return stat
 
     def _task_state(self, stat):
-        if self._cache.status is None:
+        cache = self._cache
+        if cache.status is None:
             stat.summary(DiagnosticStatus.STALE, 'no data')
-            self._apply_common_kv(stat, 'state')
+            self._apply_common_kv(stat, cache, 'state')
             return stat
         level, msg, new_unknown = diagnose_state(
-            self._cache.status,
+            cache.status,
             STATE_LEVEL_MAP.keys(),
             self._unknown_states_seen,
         )
@@ -299,51 +361,55 @@ class StarlinkDiagnosticsNode(Node):
             self._unknown_states_seen.add(name)
             self.get_logger().warning(f'Starlink: unknown status.state value: {name}')
         stat.summary(level, msg)
-        self._apply_common_kv(stat, 'state')
+        self._apply_common_kv(stat, cache, 'state')
         return stat
 
     def _task_link(self, stat):
-        if self._cache.status is None:
+        cache = self._cache
+        if cache.status is None:
             stat.summary(DiagnosticStatus.STALE, 'no data')
-            self._apply_common_kv(stat, 'link')
+            self._apply_common_kv(stat, cache, 'link')
             return stat
         level, msg = diagnose_link(
-            self._cache.status,
+            cache.status,
             self.thresholds,
-            self._cache.first_searching_monotonic,
+            cache.first_searching_monotonic,
             time.monotonic(),
         )
         stat.summary(level, msg)
-        self._apply_common_kv(stat, 'link')
+        self._apply_common_kv(stat, cache, 'link')
         return stat
 
     def _task_obstruction(self, stat):
-        if self._cache.status is None:
+        cache = self._cache
+        if cache.status is None:
             stat.summary(DiagnosticStatus.STALE, 'no data')
-            self._apply_common_kv(stat, 'obstruction')
+            self._apply_common_kv(stat, cache, 'obstruction')
             return stat
-        level, msg = diagnose_obstruction(self._cache.status, self.thresholds)
+        level, msg = diagnose_obstruction(cache.status, self.thresholds)
         stat.summary(level, msg)
-        self._apply_common_kv(stat, 'obstruction')
+        self._apply_common_kv(stat, cache, 'obstruction')
         return stat
 
     def _task_thermal(self, stat):
-        if self._cache.status is None:
+        cache = self._cache
+        if cache.status is None:
             stat.summary(DiagnosticStatus.STALE, 'no data')
-            self._apply_common_kv(stat, 'thermal')
+            self._apply_common_kv(stat, cache, 'thermal')
             return stat
-        level, msg = diagnose_thermal(self._cache.status)
+        level, msg = diagnose_thermal(cache.status)
         stat.summary(level, msg)
-        self._apply_common_kv(stat, 'thermal')
+        self._apply_common_kv(stat, cache, 'thermal')
         return stat
 
     def _task_alerts(self, stat):
-        if self._cache.status is None:
+        cache = self._cache
+        if cache.status is None:
             stat.summary(DiagnosticStatus.STALE, 'no data')
-            self._apply_common_kv(stat, 'alerts')
+            self._apply_common_kv(stat, cache, 'alerts')
             return stat
         level, msg, active, new_unknown = diagnose_alerts(
-            self._cache.status,
+            cache.status,
             ALERT_LEVEL_MAP.keys(),
             self._unknown_alerts_seen,
         )
@@ -354,10 +420,16 @@ class StarlinkDiagnosticsNode(Node):
         # Only active alerts are useful as KeyValues; the others are always false.
         for name in active:
             stat.add(f'alerts.{name}', 'true')
-        stat.add('last_query_time', self._cache.poll_wall_iso or 'never')
+        stat.add('last_query_time', cache.poll_wall_iso or 'never')
         return stat
 
     def destroy_node(self):
+        # Shut down the gRPC worker thread before closing the channel; don't
+        # wait, as a hung RPC would block shutdown indefinitely.
+        try:
+            self._grpc_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
         if self._channel is not None:
             try:
                 self._channel.close()

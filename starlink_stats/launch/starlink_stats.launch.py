@@ -8,6 +8,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -70,9 +71,16 @@ def generate_launch_description():
         ),
     ]
 
-    parameters = [{
-        arg.name: LaunchConfiguration(arg.name) for arg in args
-    }]
+    # LaunchConfiguration always yields string substitutions. ROS 2 coerces
+    # strings to float transparently, but bool('false') == True, so bool
+    # params must be delivered with an explicit ParameterValue type.
+    def _param(arg_name):
+        cfg = LaunchConfiguration(arg_name)
+        if arg_name == 'dump_all_fields':
+            return ParameterValue(cfg, value_type=bool)
+        return cfg
+
+    parameters = [{arg.name: _param(arg.name) for arg in args}]
 
     return LaunchDescription([
         *args,
