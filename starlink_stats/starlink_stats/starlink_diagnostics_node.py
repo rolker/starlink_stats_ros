@@ -59,7 +59,13 @@ DISH_GET_STATUS_KEY = 'dish_get_status'
 
 @dataclass
 class CachedStatus:
-    """Latest dish status response plus metadata."""
+    """
+    Latest dish status response plus metadata.
+
+    All fields read by both the rclpy thread and the gRPC worker thread are
+    held here so the whole struct can be replaced atomically on each poll
+    completion, avoiding cross-thread races.
+    """
 
     status: Optional[dict] = None  # the dish_get_status sub-dict
     response: Optional[dict] = None  # full response (used for dump_all_fields)
@@ -67,6 +73,12 @@ class CachedStatus:
     poll_wall_iso: str = ''  # ISO-8601 UTC at last successful poll
     error_message: Optional[str] = None  # non-None if last poll attempt failed
     first_searching_monotonic: Optional[float] = None  # tracks SEARCHING entry
+    # Reconnect bookkeeping — ride the atomic cache swap so reads from the
+    # rclpy thread (_poll_callback, _task_comms) never see torn values
+    # written by the gRPC worker thread.
+    reconnect_attempts: int = 0
+    reconnect_backoff_sec: float = 0.0
+    next_reconnect_monotonic: float = 0.0
 
 
 class StarlinkDiagnosticsNode(Node):
@@ -127,9 +139,6 @@ class StarlinkDiagnosticsNode(Node):
         self._cache = CachedStatus()
         self._channel = None
         self._stub = None
-        self._reconnect_attempts = 0
-        self._reconnect_backoff_sec = 0.0
-        self._next_reconnect_monotonic = 0.0
         self._unknown_states_seen: set[str] = set()
         self._unknown_alerts_seen: set[str] = set()
 
@@ -182,32 +191,30 @@ class StarlinkDiagnosticsNode(Node):
         else:
             self._stub = None
 
-    def _schedule_reconnect(self, now_monotonic: float):
-        """Bump exponential backoff and set the next allowed reconnect time."""
-        self._reconnect_attempts += 1
-        exp = min(self._reconnect_attempts, self._BACKOFF_CAP_EXP)
-        self._reconnect_backoff_sec = min(self._BACKOFF_MAX_SEC, float(2 ** exp))
-        self._next_reconnect_monotonic = now_monotonic + self._reconnect_backoff_sec
+    def _compute_backoff_sec(self, next_attempts: int) -> float:
+        """Compute the backoff duration for the given attempt count."""
+        exp = min(next_attempts, self._BACKOFF_CAP_EXP)
+        return min(self._BACKOFF_MAX_SEC, float(2 ** exp))
 
     # --- Poll cycle ---
 
     def _poll_callback(self):
         """Kick off a background gRPC poll. Runs on the rclpy executor thread."""
+        cache = self._cache  # snapshot
         now_mono = time.monotonic()
 
         if not _HAS_SPACEX_API:
             # Atomic cache swap; preserve SEARCHING tracking from prior state.
-            prev = self._cache
             self._cache = CachedStatus(
-                poll_monotonic=prev.poll_monotonic,
-                poll_wall_iso=prev.poll_wall_iso,
+                poll_monotonic=cache.poll_monotonic,
+                poll_wall_iso=cache.poll_wall_iso,
                 error_message='spacex_api protobuf modules not found',
-                first_searching_monotonic=prev.first_searching_monotonic,
+                first_searching_monotonic=cache.first_searching_monotonic,
             )
             return
 
         # Respect backoff window after a failure.
-        if self._reconnect_attempts > 0 and now_mono < self._next_reconnect_monotonic:
+        if cache.reconnect_attempts > 0 and now_mono < cache.next_reconnect_monotonic:
             return
 
         # Claim the in-flight slot; skip this tick if a previous query is
@@ -217,8 +224,20 @@ class StarlinkDiagnosticsNode(Node):
                 return
             self._poll_in_flight = True
 
-        future = self._grpc_executor.submit(self._blocking_query)
-        future.add_done_callback(self._handle_poll_result)
+        # If submit() or add_done_callback() raise, _poll_in_flight would
+        # otherwise stay True permanently and silently stop polling.
+        future = None
+        try:
+            future = self._grpc_executor.submit(self._blocking_query)
+            future.add_done_callback(self._handle_poll_result)
+        except Exception as exc:  # pragma: no cover - executor shutdown / saturation
+            with self._poll_lock:
+                self._poll_in_flight = False
+            if future is not None:
+                future.cancel()
+            self.get_logger().warning(
+                f'Failed to schedule Starlink gRPC poll: {exc}'
+            )
 
     def _blocking_query(self) -> tuple[dict, float, str]:
         """Run on the gRPC worker thread; returns parsed response + timestamps."""
@@ -249,8 +268,12 @@ class StarlinkDiagnosticsNode(Node):
                 # Preserve last-known status/response so non-comms tasks can
                 # keep reporting their prior values until they age into STALE
                 # via stale_timeout_sec. The comms task surfaces the failure
-                # via error_message.
+                # via error_message. Reconnect counters are updated in the
+                # same atomic swap so the rclpy thread never sees a torn
+                # view of the backoff state.
                 prev = self._cache
+                next_attempts = prev.reconnect_attempts + 1
+                backoff_sec = self._compute_backoff_sec(next_attempts)
                 self._cache = CachedStatus(
                     status=prev.status,
                     response=prev.response,
@@ -258,8 +281,10 @@ class StarlinkDiagnosticsNode(Node):
                     poll_wall_iso=prev.poll_wall_iso,
                     error_message=f'dish unreachable ({code_name})',
                     first_searching_monotonic=prev.first_searching_monotonic,
+                    reconnect_attempts=next_attempts,
+                    reconnect_backoff_sec=backoff_sec,
+                    next_reconnect_monotonic=time.monotonic() + backoff_sec,
                 )
-                self._schedule_reconnect(time.monotonic())
                 try:
                     self._connect()
                 except Exception as ex:  # pragma: no cover - grpc internals
@@ -282,6 +307,8 @@ class StarlinkDiagnosticsNode(Node):
             else:
                 first_search = None
 
+            # Success resets reconnect counters via the default dataclass
+            # values; no need to carry them from prev.
             self._cache = CachedStatus(
                 status=status,
                 response=full,
@@ -290,8 +317,6 @@ class StarlinkDiagnosticsNode(Node):
                 error_message=None,
                 first_searching_monotonic=first_search,
             )
-            self._reconnect_attempts = 0
-            self._reconnect_backoff_sec = 0.0
         finally:
             with self._poll_lock:
                 self._poll_in_flight = False
@@ -325,6 +350,34 @@ class StarlinkDiagnosticsNode(Node):
             if val is not None:
                 stat.add(path, str(val))
 
+    def _short_circuit_stale(self, stat, cache: 'CachedStatus', task_name: str) -> bool:
+        """
+        Emit STALE and return True when there is no data or cached data is too old.
+
+        Called at the top of every non-``comms`` task so the whole dashboard
+        moves to STALE together once the last poll is older than
+        ``stale_timeout_sec``, instead of the other tasks silently reporting
+        stale threshold evaluations while ``comms`` alone shows STALE.
+        """
+        if cache.status is None:
+            stat.summary(DiagnosticStatus.STALE, 'no data')
+            self._apply_common_kv(stat, cache, task_name)
+            return True
+        now_mono = time.monotonic()
+        if self._is_stale(cache, now_mono):
+            age = self._data_age(cache, now_mono)
+            if age is None:
+                msg = 'no data'
+            else:
+                msg = (
+                    f'cached data {age:.1f}s old '
+                    f'(stale_timeout_sec={self.thresholds.stale_timeout_sec})'
+                )
+            stat.summary(DiagnosticStatus.STALE, msg)
+            self._apply_common_kv(stat, cache, task_name)
+            return True
+        return False
+
     # --- Task callbacks ---
 
     def _task_comms(self, stat):
@@ -350,16 +403,14 @@ class StarlinkDiagnosticsNode(Node):
             stat.summary(DiagnosticStatus.OK, f'dish reachable ({age:.1f}s ago)')
 
         self._apply_common_kv(stat, cache, 'comms')
-        if self._reconnect_attempts > 0:
-            stat.add('reconnect_attempts', str(self._reconnect_attempts))
-            stat.add('reconnect_backoff_sec', f'{self._reconnect_backoff_sec:.1f}')
+        if cache.reconnect_attempts > 0:
+            stat.add('reconnect_attempts', str(cache.reconnect_attempts))
+            stat.add('reconnect_backoff_sec', f'{cache.reconnect_backoff_sec:.1f}')
         return stat
 
     def _task_state(self, stat):
         cache = self._cache
-        if cache.status is None:
-            stat.summary(DiagnosticStatus.STALE, 'no data')
-            self._apply_common_kv(stat, cache, 'state')
+        if self._short_circuit_stale(stat, cache, 'state'):
             return stat
         level, msg, new_unknown = diagnose_state(
             cache.status,
@@ -375,9 +426,7 @@ class StarlinkDiagnosticsNode(Node):
 
     def _task_link(self, stat):
         cache = self._cache
-        if cache.status is None:
-            stat.summary(DiagnosticStatus.STALE, 'no data')
-            self._apply_common_kv(stat, cache, 'link')
+        if self._short_circuit_stale(stat, cache, 'link'):
             return stat
         level, msg = diagnose_link(
             cache.status,
@@ -391,9 +440,7 @@ class StarlinkDiagnosticsNode(Node):
 
     def _task_obstruction(self, stat):
         cache = self._cache
-        if cache.status is None:
-            stat.summary(DiagnosticStatus.STALE, 'no data')
-            self._apply_common_kv(stat, cache, 'obstruction')
+        if self._short_circuit_stale(stat, cache, 'obstruction'):
             return stat
         level, msg = diagnose_obstruction(cache.status, self.thresholds)
         stat.summary(level, msg)
@@ -402,9 +449,7 @@ class StarlinkDiagnosticsNode(Node):
 
     def _task_thermal(self, stat):
         cache = self._cache
-        if cache.status is None:
-            stat.summary(DiagnosticStatus.STALE, 'no data')
-            self._apply_common_kv(stat, cache, 'thermal')
+        if self._short_circuit_stale(stat, cache, 'thermal'):
             return stat
         level, msg = diagnose_thermal(cache.status)
         stat.summary(level, msg)
@@ -413,9 +458,7 @@ class StarlinkDiagnosticsNode(Node):
 
     def _task_alerts(self, stat):
         cache = self._cache
-        if cache.status is None:
-            stat.summary(DiagnosticStatus.STALE, 'no data')
-            self._apply_common_kv(stat, cache, 'alerts')
+        if self._short_circuit_stale(stat, cache, 'alerts'):
             return stat
         level, msg, active, new_unknown = diagnose_alerts(
             cache.status,
