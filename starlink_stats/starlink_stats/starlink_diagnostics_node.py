@@ -246,8 +246,14 @@ class StarlinkDiagnosticsNode(Node):
                     code = e.code()
                     if code is not None:
                         code_name = code.name
+                # Preserve last-known status/response so non-comms tasks can
+                # keep reporting their prior values until they age into STALE
+                # via stale_timeout_sec. The comms task surfaces the failure
+                # via error_message.
                 prev = self._cache
                 self._cache = CachedStatus(
+                    status=prev.status,
+                    response=prev.response,
                     poll_monotonic=prev.poll_monotonic,
                     poll_wall_iso=prev.poll_wall_iso,
                     error_message=f'dish unreachable ({code_name})',
@@ -325,7 +331,10 @@ class StarlinkDiagnosticsNode(Node):
         """Report gRPC reachability, last-query age, and reconnect state."""
         cache = self._cache  # snapshot
         now_mono = time.monotonic()
-        if cache.error_message and cache.status is None:
+        if cache.error_message:
+            # Most recent poll attempt failed. Surface the error here; the
+            # other tasks continue to read the last-known status from the
+            # cache until they age into STALE via stale_timeout_sec.
             stat.summary(DiagnosticStatus.ERROR, cache.error_message)
         elif cache.status is None:
             stat.summary(DiagnosticStatus.STALE, 'no successful poll yet')
@@ -417,10 +426,10 @@ class StarlinkDiagnosticsNode(Node):
             self._unknown_alerts_seen.add(name)
             self.get_logger().warning(f'Starlink: unknown alert name: {name}')
         stat.summary(level, msg)
+        self._apply_common_kv(stat, cache, 'alerts')
         # Only active alerts are useful as KeyValues; the others are always false.
         for name in active:
             stat.add(f'alerts.{name}', 'true')
-        stat.add('last_query_time', cache.poll_wall_iso or 'never')
         return stat
 
     def destroy_node(self):

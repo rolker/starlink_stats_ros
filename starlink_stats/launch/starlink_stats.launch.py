@@ -27,7 +27,10 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             'grpc_timeout_sec', default_value='2.0',
-            description='Per-request gRPC timeout. Must be < 1/poll_rate to avoid backlog.',
+            description=(
+                'Per-request gRPC timeout. Larger values can reduce the '
+                'effective poll rate and increase staleness risk.'
+            ),
         ),
         DeclareLaunchArgument(
             'stale_timeout_sec', default_value='5.0',
