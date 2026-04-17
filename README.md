@@ -2,46 +2,56 @@
 
 ## Overview
 
-This ROS node is responsible for connecting to your local Starlink dish, querying its grpc server to retrieve diagnostic data, then transforming that data into a ROS diagnostics message. It was written in Python and runs as a ROS node.
+ROS 2 node that connects to a Starlink dish via gRPC, queries its diagnostic
+status, and publishes it as a `diagnostic_msgs/DiagnosticArray` at a steady
+1 Hz cadence. Uses `diagnostic_updater` with six named tasks (comms, state,
+link, obstruction, thermal, alerts).
 
 ## Prerequisites
 
-- ROS installed on your system (tested on ROS Melodic and Noetic)
-- Python 3.x
-- Starlink Dish
-- Your dishs generated python code, from its .protobuf. Read more about how to interact with your dishs grpc server [here](https://github.com/sparky8512/starlink-grpc-tools/wiki/gRPC-Protocol-Modules)
+- ROS 2 (Jazzy or later)
+- Python 3
+- Starlink dish reachable at its gRPC address (default `192.168.100.1:9200`)
+
+## gRPC Proto Discovery
+
+The node discovers the dish's protobuf schema **at runtime** via gRPC server
+reflection — no pre-generated stubs or manual proto extraction needed. On the
+first successful connection, the node:
+
+1. Calls the dish's reflection service to fetch protobuf descriptors.
+2. Builds dynamic message classes using `google.protobuf.descriptor_pool`.
+3. Caches the descriptors at `~/.cache/starlink_stats/` keyed by firmware
+   version, so reflection only runs once per firmware version.
+
+This makes the package resilient to dish hardware variants (Gen1, Gen2, Mini)
+and firmware updates that change the protobuf schema.
 
 ## Installation
 
-1. Clone this package into your existing ROS worksapce
-2. Copy the 'spacex' folder containing your dishs grpc code into the src folder so that it looks like bellow: 
-```bash
-THIS PACKAGE
-└── src
-    ├── spacex
-    │   ├── api
-    │   │   ├── common
-    │   ... ...
-    └── starlink_grpc
-        ├── get_starlink_stats.py
-        └── __init__.py
-```
-3. Make sure the spacex folder is initialized as a python module with __init__'s, if not you can use the setup.sh script which will initialize.
-4. In the base folder of this package, run `pip install -e`
-5. Build your catkin_workspace
-6. Now launch the node using `rosrun starlink_stats_ros starlink_diagnostics_node.py` or buy adding to your larger ROS launchfile arcitecture. 
+1. Clone this package into a ROS 2 workspace `src/` directory.
+2. Build with `colcon build --packages-select starlink_stats --symlink-install`.
+3. Source the workspace: `source install/setup.bash`.
 
-## Notes:
-- The device running this node will need to be able to access the 192.168.100.1 address of the dish.
-- If you're just using the stock starlink router, it typically has a route preconfigured onboard for devices on its 192.168.1.x network to be able to access the dish.
-- If you run `nmap 192.168.100.1` the output should look like: 
+No additional steps needed — the node handles proto discovery automatically.
+
+## Usage
+
 ```bash
-Nmap scan report for mbmoxac (192.168.100.1)
-Host is up (0.0041s latency).
-Not shown: 997 filtered ports
-PORT     STATE SERVICE
-22/tcp   open  ssh
-80/tcp   open  http
-9200/tcp open  wap-wsp
+ros2 launch starlink_stats starlink_stats.launch.py
 ```
 
+Key parameters (all configurable via launch args):
+
+- `dish_address` — gRPC address (default `192.168.100.1:9200`)
+- `hardware_id` — suffix for diagnostic names (default: auto-detected from dish)
+- `poll_rate` — status polling rate in Hz (default `1.0`)
+- `dump_all_fields` — include full flattened response as KeyValues (default `false`)
+- `stale_timeout_sec` — age beyond which cached status is STALE (default `5.0`)
+
+## Notes
+
+- The device running this node must be able to reach the dish's `192.168.100.1`
+  address on port 9200 (gRPC).
+- If using the stock Starlink router, it typically has a route preconfigured for
+  devices on its `192.168.1.x` network.

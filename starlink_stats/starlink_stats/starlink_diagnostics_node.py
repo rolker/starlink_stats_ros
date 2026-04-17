@@ -25,7 +25,6 @@ from typing import Optional
 
 from diagnostic_msgs.msg import DiagnosticStatus
 import diagnostic_updater
-from google.protobuf.json_format import MessageToDict
 import grpc
 import rclpy
 from rclpy.node import Node
@@ -43,15 +42,13 @@ from starlink_stats.diagnostics_logic import (
     STATE_LEVEL_MAP,
     Thresholds,
 )
-
-try:
-    from spacex_api.device import device_pb2
-    from spacex_api.device import device_pb2_grpc
-    _HAS_SPACEX_API = True
-except ImportError:
-    device_pb2 = None
-    device_pb2_grpc = None
-    _HAS_SPACEX_API = False
+from starlink_stats.grpc_reflection import (
+    cached_firmware_version,
+    DeviceCaller,
+    load_cached_fds,
+    reflect,
+    save_cached_fds,
+)
 
 
 DISH_GET_STATUS_KEY = 'dish_get_status'
@@ -138,7 +135,8 @@ class StarlinkDiagnosticsNode(Node):
         # at entry and not re-read self._cache during one update.
         self._cache = CachedStatus()
         self._channel = None
-        self._stub = None
+        self._device_caller: Optional[DeviceCaller] = None
+        self._cached_fds: Optional[bytes] = load_cached_fds()
         self._unknown_states_seen: set[str] = set()
         self._unknown_alerts_seen: set[str] = set()
         self._schema_logged = False
@@ -186,17 +184,16 @@ class StarlinkDiagnosticsNode(Node):
     # --- gRPC channel management ---
 
     def _connect(self):
-        """Create or recreate the gRPC channel and stub."""
+        """Create or recreate the gRPC channel. Clears the device caller."""
         if self._channel is not None:
             try:
                 self._channel.close()
             except Exception:
                 pass
         self._channel = grpc.insecure_channel(self.dish_address)
-        if _HAS_SPACEX_API:
-            self._stub = device_pb2_grpc.DeviceStub(self._channel)
-        else:
-            self._stub = None
+        # Device caller will be (re)created on the next poll via reflection
+        # or from the cached descriptor set.
+        self._device_caller = None
 
     def _compute_backoff_sec(self, next_attempts: int) -> float:
         """Compute the backoff duration for the given attempt count."""
@@ -209,16 +206,6 @@ class StarlinkDiagnosticsNode(Node):
         """Kick off a background gRPC poll. Runs on the rclpy executor thread."""
         cache = self._cache  # snapshot
         now_mono = time.monotonic()
-
-        if not _HAS_SPACEX_API:
-            # Atomic cache swap; preserve SEARCHING tracking from prior state.
-            self._cache = CachedStatus(
-                poll_monotonic=cache.poll_monotonic,
-                poll_wall_iso=cache.poll_wall_iso,
-                error_message='spacex_api protobuf modules not found',
-                first_searching_monotonic=cache.first_searching_monotonic,
-            )
-            return
 
         # Respect backoff window after a failure.
         if cache.reconnect_attempts > 0 and now_mono < cache.next_reconnect_monotonic:
@@ -246,17 +233,34 @@ class StarlinkDiagnosticsNode(Node):
                 f'Failed to schedule Starlink gRPC poll: {exc}'
             )
 
+    def _ensure_device_caller(self) -> DeviceCaller:
+        """Build a DeviceCaller, reflecting if needed. Runs on the gRPC thread."""
+        if self._device_caller is not None:
+            return self._device_caller
+
+        fds_bytes = self._cached_fds
+        if fds_bytes is not None:
+            try:
+                caller = DeviceCaller.from_fds(fds_bytes, self._channel)
+                self._device_caller = caller
+                self.get_logger().info('Using cached proto descriptors')
+                return caller
+            except Exception:
+                # Cache is stale or corrupt — fall through to reflection.
+                self._cached_fds = None
+
+        self.get_logger().info('Reflecting Starlink gRPC service...')
+        fds_bytes = reflect(self._channel, timeout=self.grpc_timeout_sec)
+        caller = DeviceCaller.from_fds(fds_bytes, self._channel)
+        self._cached_fds = fds_bytes
+        self._device_caller = caller
+        self.get_logger().info('Reflection complete')
+        return caller
+
     def _blocking_query(self) -> tuple[dict, float, str]:
         """Run on the gRPC worker thread; returns parsed response + timestamps."""
-        response = self._stub.Handle(
-            device_pb2.Request(get_status={}),
-            timeout=self.grpc_timeout_sec,
-        )
-        full = MessageToDict(
-            response,
-            preserving_proto_field_name=True,
-            including_default_value_fields=True,
-        )
+        caller = self._ensure_device_caller()
+        full = caller.get_status(timeout=self.grpc_timeout_sec)
         now_mono = time.monotonic()
         now_iso = datetime.now(timezone.utc).isoformat(timespec='seconds')
         return full, now_mono, now_iso
@@ -327,6 +331,7 @@ class StarlinkDiagnosticsNode(Node):
 
             # One-shot schema fingerprint: log top-level fields from the
             # dish_get_status sub-dict so variant differences are visible.
+            # Also persist the descriptor cache keyed by firmware version.
             if not self._schema_logged and isinstance(status, dict):
                 sw = get_dotted(status, 'device_info.software_version') or '?'
                 hw = get_dotted(status, 'device_info.hardware_version') or '?'
@@ -335,6 +340,12 @@ class StarlinkDiagnosticsNode(Node):
                     f'Dish schema (hw={hw}, sw={sw}): '
                     f'{", ".join(keys)}'
                 )
+                # Save/update the descriptor cache if we have descriptors
+                # and the firmware version is known.
+                if self._cached_fds is not None and sw != '?':
+                    old_ver = cached_firmware_version()
+                    if old_ver != sw:
+                        save_cached_fds(self._cached_fds, sw)
                 self._schema_logged = True
         finally:
             with self._poll_lock:
