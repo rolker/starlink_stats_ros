@@ -141,6 +141,7 @@ class StarlinkDiagnosticsNode(Node):
         self._unknown_alerts_seen: set[str] = set()
         self._schema_logged = False
         self._known_firmware: Optional[str] = None
+        self._fds_needs_save = False
 
         # gRPC runs on a single-worker background thread so a slow or hung
         # call never blocks the rclpy executor (and therefore the Updater's
@@ -354,11 +355,9 @@ class StarlinkDiagnosticsNode(Node):
                 # Track firmware version. On change (e.g. OTA update while
                 # the node is running), invalidate both the active caller and
                 # the in-memory descriptor cache so the next poll must
-                # re-reflect to pick up schema changes. Don't save the cache
-                # here — the stale descriptors belong to the old firmware.
-                # After re-reflection, _ensure_device_caller sets _cached_fds
-                # with fresh descriptors, and the next successful poll will
-                # persist them under the new firmware version.
+                # re-reflect to pick up schema changes. Mark the cache dirty
+                # so the freshly reflected descriptors are persisted once the
+                # next poll succeeds.
                 if sw != '?' and sw != self._known_firmware:
                     if self._known_firmware is not None:
                         self.get_logger().info(
@@ -367,12 +366,18 @@ class StarlinkDiagnosticsNode(Node):
                         )
                         self._device_caller = None
                         self._cached_fds = None
+                        self._fds_needs_save = True
                     else:
-                        # First poll — save current descriptors under this
-                        # firmware version.
+                        # First poll — save current descriptors.
                         if self._cached_fds is not None:
                             save_cached_fds(self._cached_fds, sw)
                     self._known_firmware = sw
+                elif self._fds_needs_save and self._cached_fds is not None:
+                    # Post-re-reflection: freshly reflected descriptors are
+                    # now in _cached_fds — persist them under the current
+                    # firmware version.
+                    save_cached_fds(self._cached_fds, sw)
+                    self._fds_needs_save = False
         finally:
             with self._poll_lock:
                 self._poll_in_flight = False
