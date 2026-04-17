@@ -352,9 +352,13 @@ class StarlinkDiagnosticsNode(Node):
                     self._schema_logged = True
 
                 # Track firmware version. On change (e.g. OTA update while
-                # the node is running), clear the device caller so the next
-                # poll re-reflects to pick up any schema changes, and update
-                # the descriptor cache.
+                # the node is running), invalidate both the active caller and
+                # the in-memory descriptor cache so the next poll must
+                # re-reflect to pick up schema changes. Don't save the cache
+                # here — the stale descriptors belong to the old firmware.
+                # After re-reflection, _ensure_device_caller sets _cached_fds
+                # with fresh descriptors, and the next successful poll will
+                # persist them under the new firmware version.
                 if sw != '?' and sw != self._known_firmware:
                     if self._known_firmware is not None:
                         self.get_logger().info(
@@ -362,9 +366,13 @@ class StarlinkDiagnosticsNode(Node):
                             f'{sw}; will re-reflect on next poll'
                         )
                         self._device_caller = None
+                        self._cached_fds = None
+                    else:
+                        # First poll — save current descriptors under this
+                        # firmware version.
+                        if self._cached_fds is not None:
+                            save_cached_fds(self._cached_fds, sw)
                     self._known_firmware = sw
-                    if self._cached_fds is not None:
-                        save_cached_fds(self._cached_fds, sw)
         finally:
             with self._poll_lock:
                 self._poll_in_flight = False
