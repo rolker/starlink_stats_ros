@@ -25,6 +25,7 @@ from typing import Optional
 
 from diagnostic_msgs.msg import DiagnosticStatus
 import diagnostic_updater
+from google.protobuf.message import DecodeError
 import grpc
 import rclpy
 from rclpy.node import Node
@@ -245,7 +246,7 @@ class StarlinkDiagnosticsNode(Node):
                 self._device_caller = caller
                 self.get_logger().info('Using cached proto descriptors')
                 return caller
-            except (KeyError, TypeError, ValueError) as exc:
+            except (DecodeError, KeyError, TypeError, ValueError) as exc:
                 self.get_logger().warning(
                     f'Cached proto descriptors unusable, falling back to '
                     f'reflection: {exc}'

@@ -21,8 +21,8 @@ first successful connection, the node:
 
 1. Calls the dish's reflection service to fetch protobuf descriptors.
 2. Builds dynamic message classes using `google.protobuf.descriptor_pool`.
-3. Caches the descriptors at `~/.cache/starlink_stats/` keyed by firmware
-   version, so reflection only runs once per firmware version.
+3. Caches the descriptors at `~/.cache/starlink_stats/` for reuse on later
+   startups, and refreshes the cache if the dish firmware version changes.
 
 This makes the package resilient to dish hardware variants (Gen1, Gen2, Mini)
 and firmware updates that change the protobuf schema.
