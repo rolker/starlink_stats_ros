@@ -245,8 +245,11 @@ class StarlinkDiagnosticsNode(Node):
                 self._device_caller = caller
                 self.get_logger().info('Using cached proto descriptors')
                 return caller
-            except Exception:
-                # Cache is stale or corrupt — fall through to reflection.
+            except (KeyError, TypeError, ValueError) as exc:
+                self.get_logger().warning(
+                    f'Cached proto descriptors unusable, falling back to '
+                    f'reflection: {exc}'
+                )
                 self._cached_fds = None
 
         self.get_logger().info('Reflecting Starlink gRPC service...')

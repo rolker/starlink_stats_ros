@@ -18,6 +18,7 @@ only runs on the first connection per firmware version.
 
 from __future__ import annotations
 
+from collections import deque
 from pathlib import Path
 from typing import Optional
 
@@ -151,10 +152,14 @@ def _reflection_call(channel, method, request, timeout=5.0):
         request_serializer=type(request).SerializeToString,
         response_deserializer=_ReflResp.FromString,
     )
-    responses = list(multi_callable(iter([request]), timeout=timeout))
-    if not responses:
-        raise RuntimeError('No reflection response received')
-    resp = responses[0]
+    response_iter = multi_callable(iter([request]), timeout=timeout)
+    try:
+        try:
+            resp = next(response_iter)
+        except StopIteration:
+            raise RuntimeError('No reflection response received')
+    finally:
+        response_iter.cancel()
     if resp.HasField('error_response'):
         raise RuntimeError(
             f'Reflection error: {resp.error_response.error_message}'
@@ -200,14 +205,14 @@ def _fetch_descriptors_for_symbol(
         fetched[fdp.name] = fdp
 
     # Recursively fetch dependencies.
-    to_fetch: list[str] = []
+    to_fetch: deque[str] = deque()
     for fdp in list(fetched.values()):
         for dep in fdp.dependency:
             if dep not in fetched:
                 to_fetch.append(dep)
 
     while to_fetch:
-        dep_name = to_fetch.pop(0)
+        dep_name = to_fetch.popleft()
         if dep_name in fetched:
             continue
         req = _ReflReq()
@@ -216,7 +221,8 @@ def _fetch_descriptors_for_symbol(
             resp = _reflection_call(channel, method, req, timeout)
         except RuntimeError:
             # Some deps (e.g. google/protobuf/*.proto) may not be served
-            # by reflection. Skip — the default pool has them.
+            # by reflection. Skip — from_fds() uses Default() pool which
+            # has well-known types pre-loaded.
             continue
         for raw in resp.file_descriptor_response.file_descriptor_proto:
             fdp = descriptor_pb2.FileDescriptorProto()
@@ -290,13 +296,17 @@ class DeviceCaller:
         fds = descriptor_pb2.FileDescriptorSet()
         fds.ParseFromString(fds_bytes)
 
-        pool = descriptor_pool.DescriptorPool()
+        # Use the default pool so well-known types (google/protobuf/*.proto)
+        # are available for deps that the reflection service didn't serve.
+        pool = descriptor_pool.Default()
         for fdp in fds.file:
             try:
                 pool.Add(fdp)
-            except TypeError:
-                # Already present (e.g., google/protobuf builtins).
-                pass
+            except ValueError as exc:
+                # Ignore duplicate descriptor adds (e.g., file already in
+                # the default pool); surface all other add failures.
+                if 'duplicate file name' not in str(exc):
+                    raise
 
         factory = message_factory.MessageFactory(pool=pool)
         req_desc = pool.FindMessageTypeByName(_REQUEST_TYPE)

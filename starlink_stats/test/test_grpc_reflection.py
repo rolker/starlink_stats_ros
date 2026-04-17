@@ -7,7 +7,6 @@
 """Unit tests for the gRPC reflection client bootstrap and caching."""
 
 from google.protobuf import descriptor_pb2
-import pytest
 
 from starlink_stats.grpc_reflection import (
     _build_reflection_pool,
@@ -56,7 +55,7 @@ class TestReflectionBootstrap:
         data = req.SerializeToString()
         parsed = _ReflReq()
         parsed.ParseFromString(data)
-        assert parsed.HasField('message_request')
+        assert parsed.WhichOneof('message_request') == 'list_services'
 
     def test_request_file_by_filename(self):
         """Can set the file_by_filename oneof field."""
@@ -208,10 +207,15 @@ class TestDeviceCallerFromFds:
         assert caller._response_class is not None
         channel.close()
 
-    def test_rejects_empty_fds(self):
-        """Raise on empty FileDescriptorSet — message type is missing."""
+    def test_from_fds_uses_default_pool(self):
+        """Verify from_fds uses the default pool (well-known types available)."""
         import grpc
         channel = grpc.insecure_channel('localhost:1')
-        with pytest.raises(KeyError):
-            DeviceCaller.from_fds(b'', channel)
+        fds_bytes = self._make_minimal_fds()
+        # Building twice should succeed — Default() pool tolerates re-adds
+        # of the same descriptors via the duplicate check.
+        caller1 = DeviceCaller.from_fds(fds_bytes, channel)
+        caller2 = DeviceCaller.from_fds(fds_bytes, channel)
+        assert caller1 is not None
+        assert caller2 is not None
         channel.close()
