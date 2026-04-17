@@ -1,7 +1,3 @@
-starlink_stats/spacex_api/
-.proto
-.protobuf
-
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
