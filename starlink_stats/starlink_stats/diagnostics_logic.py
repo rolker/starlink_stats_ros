@@ -185,7 +185,7 @@ def diagnose_state(
     """
     state = status.get('state')
     if state is None:
-        return DiagnosticStatus.WARN, 'state field missing from response', []
+        return DiagnosticStatus.OK, 'state not reported by dish', []
     state_str = str(state)
     known = set(known_states)
     if state_str not in known:

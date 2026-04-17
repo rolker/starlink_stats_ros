@@ -141,6 +141,7 @@ class StarlinkDiagnosticsNode(Node):
         self._stub = None
         self._unknown_states_seen: set[str] = set()
         self._unknown_alerts_seen: set[str] = set()
+        self._schema_logged = False
 
         # gRPC runs on a single-worker background thread so a slow or hung
         # call never blocks the rclpy executor (and therefore the Updater's
@@ -323,6 +324,18 @@ class StarlinkDiagnosticsNode(Node):
                 error_message=None,
                 first_searching_monotonic=first_search,
             )
+
+            # One-shot schema fingerprint: log top-level fields from the
+            # dish_get_status sub-dict so variant differences are visible.
+            if not self._schema_logged and isinstance(status, dict):
+                sw = get_dotted(status, 'device_info.software_version') or '?'
+                hw = get_dotted(status, 'device_info.hardware_version') or '?'
+                keys = sorted(status.keys())
+                self.get_logger().info(
+                    f'Dish schema (hw={hw}, sw={sw}): '
+                    f'{", ".join(keys)}'
+                )
+                self._schema_logged = True
         finally:
             with self._poll_lock:
                 self._poll_in_flight = False

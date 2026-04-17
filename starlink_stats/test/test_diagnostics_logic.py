@@ -87,9 +87,10 @@ def test_diagnose_state_known_values(state, expected):
 
 
 def test_diagnose_state_missing_field():
+    """Missing state field is OK — normal for some dish variants/firmware."""
     level, msg, new_unknown = diagnose_state({}, STATE_LEVEL_MAP.keys(), set())
-    assert level == WARN
-    assert 'missing' in msg
+    assert level == OK
+    assert 'not reported' in msg
     assert new_unknown == []
 
 
@@ -420,3 +421,95 @@ def test_thresholds_defaults_sane():
     assert t.ping_latency_warn_ms < t.ping_latency_error_ms
     assert t.searching_warn_delay_sec > 0
     assert t.stale_timeout_sec > 0
+
+
+# --- Sparse schema resilience ---
+#
+# Dish hardware variants (Gen1, Gen2, Mini) and firmware versions may omit
+# entire field subtrees. Every diagnose_* function must return OK (not WARN
+# or ERROR) when its expected fields are absent.
+
+class TestSparseSchemas:
+    """All tasks degrade gracefully on minimal or empty responses."""
+
+    # A response with only device_info — no state, no link metrics, no
+    # alerts, no obstruction stats. Simulates a firmware that dropped
+    # most of the fields the node expects.
+    MINIMAL_STATUS = {
+        'device_info': {
+            'id': 'ut01000000-00000000-test1234',
+            'hardware_version': 'rev4_prod3',
+            'software_version': '2026.99.0.mr00000',
+        },
+    }
+
+    def test_state_minimal(self):
+        level, msg, _ = diagnose_state(
+            self.MINIMAL_STATUS, STATE_LEVEL_MAP.keys(), set(),
+        )
+        assert level == OK
+        assert 'not reported' in msg
+
+    def test_link_minimal(self):
+        level, msg = diagnose_link(
+            self.MINIMAL_STATUS, Thresholds(), None, 100.0,
+        )
+        assert level == OK
+        assert 'no link data' in msg
+
+    def test_obstruction_minimal(self):
+        level, msg = diagnose_obstruction(self.MINIMAL_STATUS, Thresholds())
+        assert level == OK
+        assert 'unavailable' in msg
+
+    def test_thermal_minimal(self):
+        level, _ = diagnose_thermal(self.MINIMAL_STATUS)
+        assert level == OK
+
+    def test_alerts_minimal(self):
+        level, _, active, _ = diagnose_alerts(
+            self.MINIMAL_STATUS, ALERT_LEVEL_MAP.keys(), set(),
+        )
+        assert level == OK
+        assert active == []
+
+    def test_all_tasks_ok_on_empty_status(self):
+        """Completely empty status dict — every task should be OK."""
+        empty = {}
+        assert diagnose_state(empty, STATE_LEVEL_MAP.keys(), set())[0] == OK
+        assert diagnose_link(empty, Thresholds(), None, 0.0)[0] == OK
+        assert diagnose_obstruction(empty, Thresholds())[0] == OK
+        assert diagnose_thermal(empty)[0] == OK
+        assert diagnose_alerts(empty, ALERT_LEVEL_MAP.keys(), set())[0] == OK
+
+    def test_state_with_link_metrics_but_no_state(self):
+        """Dish reports link quality but not state enum — state task is OK."""
+        status = {
+            'pop_ping_drop_rate': 0.001,
+            'pop_ping_latency_ms': 25.0,
+            'snr_above_noise_floor': 12.0,
+        }
+        level, _, _ = diagnose_state(status, STATE_LEVEL_MAP.keys(), set())
+        assert level == OK
+
+    def test_link_with_partial_metrics(self):
+        """Only latency reported — other metrics absent, no crash or WARN."""
+        status = {'pop_ping_latency_ms': 42.0}
+        level, msg = diagnose_link(status, Thresholds(), None, 100.0)
+        assert level == OK
+        assert '42ms' in msg
+
+    def test_obstruction_with_fraction_but_no_currently(self):
+        """fraction_obstructed present but currently_obstructed absent."""
+        status = {'obstruction_stats': {'fraction_obstructed': 0.001}}
+        level, msg = diagnose_obstruction(status, Thresholds())
+        assert level == OK
+        assert '0.10%' in msg
+
+    def test_alerts_with_empty_alerts_dict(self):
+        """Empty alerts dict — no active alerts."""
+        level, msg, active, _ = diagnose_alerts(
+            {'alerts': {}}, ALERT_LEVEL_MAP.keys(), set(),
+        )
+        assert level == OK
+        assert active == []
