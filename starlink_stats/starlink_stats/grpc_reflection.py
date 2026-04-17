@@ -220,10 +220,12 @@ def _fetch_descriptors_for_symbol(
         try:
             resp = _reflection_call(channel, method, req, timeout)
         except RuntimeError:
-            # Some deps (e.g. google/protobuf/*.proto) may not be served
+            # Well-known types (google/protobuf/*.proto) may not be served
             # by reflection. Skip — from_fds() uses Default() pool which
-            # has well-known types pre-loaded.
-            continue
+            # has them pre-loaded. For all other deps, surface the error.
+            if dep_name.startswith('google/protobuf/'):
+                continue
+            raise
         for raw in resp.file_descriptor_response.file_descriptor_proto:
             fdp = descriptor_pb2.FileDescriptorProto()
             fdp.ParseFromString(raw)
@@ -341,7 +343,7 @@ def load_cached_fds() -> Optional[bytes]:
     path = CACHE_DIR / _FDS_FILE
     try:
         return path.read_bytes()
-    except (FileNotFoundError, PermissionError):
+    except OSError:
         return None
 
 
@@ -359,5 +361,5 @@ def cached_firmware_version() -> Optional[str]:
     """Return the firmware version from the cache, or None."""
     try:
         return (CACHE_DIR / _VERSION_FILE).read_text().strip()
-    except (FileNotFoundError, PermissionError):
+    except OSError:
         return None
