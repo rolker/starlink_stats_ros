@@ -444,7 +444,7 @@ class TestSparseSchemas:
     }
 
     def test_state_minimal(self):
-        level, msg, unknown = diagnose_state(
+        level, msg, _ = diagnose_state(
             self.MINIMAL_STATUS, STATE_LEVEL_MAP.keys(), set(),
         )
         assert level == OK
@@ -463,11 +463,11 @@ class TestSparseSchemas:
         assert 'unavailable' in msg
 
     def test_thermal_minimal(self):
-        level, msg = diagnose_thermal(self.MINIMAL_STATUS)
+        level, _ = diagnose_thermal(self.MINIMAL_STATUS)
         assert level == OK
 
     def test_alerts_minimal(self):
-        level, msg, active, unknown = diagnose_alerts(
+        level, _, active, _ = diagnose_alerts(
             self.MINIMAL_STATUS, ALERT_LEVEL_MAP.keys(), set(),
         )
         assert level == OK
@@ -489,7 +489,7 @@ class TestSparseSchemas:
             'pop_ping_latency_ms': 25.0,
             'snr_above_noise_floor': 12.0,
         }
-        level, msg, _ = diagnose_state(status, STATE_LEVEL_MAP.keys(), set())
+        level, _, _ = diagnose_state(status, STATE_LEVEL_MAP.keys(), set())
         assert level == OK
 
     def test_link_with_partial_metrics(self):
