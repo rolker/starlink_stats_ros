@@ -44,7 +44,6 @@ from starlink_stats.diagnostics_logic import (
     Thresholds,
 )
 from starlink_stats.grpc_reflection import (
-    cached_firmware_version,
     DeviceCaller,
     load_cached_fds,
     reflect,
@@ -141,6 +140,8 @@ class StarlinkDiagnosticsNode(Node):
         self._unknown_states_seen: set[str] = set()
         self._unknown_alerts_seen: set[str] = set()
         self._schema_logged = False
+        self._known_firmware: Optional[str] = None
+        self._fds_needs_save = False
 
         # gRPC runs on a single-worker background thread so a slow or hung
         # call never blocks the rclpy executor (and therefore the Updater's
@@ -333,24 +334,50 @@ class StarlinkDiagnosticsNode(Node):
                 first_searching_monotonic=first_search,
             )
 
-            # One-shot schema fingerprint: log top-level fields from the
-            # dish_get_status sub-dict so variant differences are visible.
-            # Also persist the descriptor cache keyed by firmware version.
-            if not self._schema_logged and isinstance(status, dict):
-                sw = get_dotted(status, 'device_info.software_version') or '?'
-                hw = get_dotted(status, 'device_info.hardware_version') or '?'
-                keys = sorted(status.keys())
-                self.get_logger().info(
-                    f'Dish schema (hw={hw}, sw={sw}): '
-                    f'{", ".join(keys)}'
-                )
-                # Save/update the descriptor cache if we have descriptors
-                # and the firmware version is known.
-                if self._cached_fds is not None and sw != '?':
-                    old_ver = cached_firmware_version()
-                    if old_ver != sw:
-                        save_cached_fds(self._cached_fds, sw)
-                self._schema_logged = True
+            # --- Schema fingerprint and firmware change detection ---
+            if isinstance(status, dict):
+                sw = get_dotted(
+                    status, 'device_info.software_version',
+                ) or '?'
+
+                # First poll: log the schema fingerprint for variant visibility.
+                if not self._schema_logged:
+                    hw = get_dotted(
+                        status, 'device_info.hardware_version',
+                    ) or '?'
+                    keys = sorted(status.keys())
+                    self.get_logger().info(
+                        f'Dish schema (hw={hw}, sw={sw}): '
+                        f'{", ".join(keys)}'
+                    )
+                    self._schema_logged = True
+
+                # Track firmware version. On change (e.g. OTA update while
+                # the node is running), invalidate both the active caller and
+                # the in-memory descriptor cache so the next poll must
+                # re-reflect to pick up schema changes. Mark the cache dirty
+                # so the freshly reflected descriptors are persisted once the
+                # next poll succeeds.
+                if sw != '?' and sw != self._known_firmware:
+                    if self._known_firmware is not None:
+                        self.get_logger().info(
+                            f'Firmware changed: {self._known_firmware} -> '
+                            f'{sw}; will re-reflect on next poll'
+                        )
+                        self._device_caller = None
+                        self._cached_fds = None
+                        self._fds_needs_save = True
+                    else:
+                        # First poll — save current descriptors.
+                        if self._cached_fds is not None:
+                            save_cached_fds(self._cached_fds, sw)
+                    self._known_firmware = sw
+                elif self._fds_needs_save and self._cached_fds is not None:
+                    # Post-re-reflection: freshly reflected descriptors are
+                    # now in _cached_fds — persist them under the current
+                    # firmware version.
+                    save_cached_fds(self._cached_fds, sw)
+                    self._fds_needs_save = False
         finally:
             with self._poll_lock:
                 self._poll_in_flight = False
