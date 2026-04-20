@@ -59,7 +59,7 @@ ALERT_LEVEL_MAP: dict[str, int] = {
     # Mechanical / installation
     'motors_stuck': DiagnosticStatus.ERROR,
     'mast_not_near_vertical': DiagnosticStatus.WARN,
-    'install_pending': DiagnosticStatus.OK,
+    'install_pending': DiagnosticStatus.WARN,
     # Location / mobility
     'unexpected_location': DiagnosticStatus.WARN,
     'moving_while_not_mobile': DiagnosticStatus.WARN,
