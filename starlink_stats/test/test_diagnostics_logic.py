@@ -376,6 +376,16 @@ def test_diagnose_alerts_unknown_reports_once():
     assert new2 == []  # not re-reported
 
 
+def test_diagnose_alerts_install_pending_is_warn():
+    level, _, active, _ = diagnose_alerts(
+        {'alerts': {'install_pending': True}},
+        ALERT_LEVEL_MAP.keys(),
+        set(),
+    )
+    assert level == WARN
+    assert 'install_pending' in active
+
+
 def test_diagnose_alerts_multiple_active_max_level_wins():
     level, _, active, _ = diagnose_alerts(
         {'alerts': {
