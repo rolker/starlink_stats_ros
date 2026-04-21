@@ -377,7 +377,7 @@ def test_diagnose_alerts_unknown_reports_once():
 
 
 def test_diagnose_alerts_install_pending_is_warn():
-    level, msg, active, _ = diagnose_alerts(
+    level, _, active, _ = diagnose_alerts(
         {'alerts': {'install_pending': True}},
         ALERT_LEVEL_MAP.keys(),
         set(),
