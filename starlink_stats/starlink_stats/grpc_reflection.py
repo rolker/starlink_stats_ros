@@ -294,21 +294,34 @@ class DeviceCaller:
         fds_bytes: bytes,
         channel: grpc.Channel,
     ) -> 'DeviceCaller':
-        """Build a DeviceCaller from a serialized FileDescriptorSet."""
+        """
+        Build a DeviceCaller from a serialized FileDescriptorSet.
+
+        Each call gets its own descriptor pool. The process-wide default pool
+        refuses a file whose name is already loaded with different contents,
+        so after a firmware update changed the dish's schema, re-reflecting
+        into it raised and every later poll failed until the node restarted.
+        """
         fds = descriptor_pb2.FileDescriptorSet()
         fds.ParseFromString(fds_bytes)
+        served = {fdp.name for fdp in fds.file}
 
-        # Use the default pool so well-known types (google/protobuf/*.proto)
-        # are available for deps that the reflection service didn't serve.
-        pool = descriptor_pool.Default()
+        pool = descriptor_pool.DescriptorPool()
+        # Well-known types (google/protobuf/*.proto) may not be served by
+        # reflection; copy any the schema imports from the default pool,
+        # where the protobuf runtime has them preloaded.
+        default_pool = descriptor_pool.Default()
+        copied: set[str] = set()
         for fdp in fds.file:
-            try:
-                pool.Add(fdp)
-            except ValueError as exc:
-                # Ignore duplicate descriptor adds (e.g., file already in
-                # the default pool); surface all other add failures.
-                if 'duplicate file name' not in str(exc):
-                    raise
+            for dep in fdp.dependency:
+                if dep in served or dep in copied:
+                    continue
+                dep_proto = descriptor_pb2.FileDescriptorProto()
+                default_pool.FindFileByName(dep).CopyToProto(dep_proto)
+                pool.Add(dep_proto)
+                copied.add(dep)
+        for fdp in fds.file:
+            pool.Add(fdp)
 
         factory = message_factory.MessageFactory(pool=pool)
         req_desc = pool.FindMessageTypeByName(_REQUEST_TYPE)
@@ -320,20 +333,36 @@ class DeviceCaller:
             channel,
         )
 
-    def get_status(self, timeout: float) -> dict:
+    def supports(self, request_field: str) -> bool:
+        """Return True if the reflected Request schema has ``request_field``."""
+        return request_field in self._request_class.DESCRIPTOR.fields_by_name
+
+    def call(self, request_field: str, timeout: float) -> dict:
         """
-        Call Device.Handle(Request(get_status={})) and return the full dict.
+        Call Device.Handle(Request(<request_field>={})) and return the full dict.
 
         Equivalent to ``MessageToDict(response, preserving_proto_field_name=True,
-        including_default_value_fields=True)``.
+        including_default_value_fields=True)``. Raises ``KeyError`` if the
+        dish's schema has no such request, so a caller can tell "this firmware
+        doesn't offer it" apart from an RPC failure.
         """
-        request = ParseDict({'get_status': {}}, self._request_class())
+        if not self.supports(request_field):
+            raise KeyError(f'dish schema has no request {request_field!r}')
+        request = ParseDict({request_field: {}}, self._request_class())
         response = self._call(request, timeout=timeout)
         return MessageToDict(
             response,
             preserving_proto_field_name=True,
             including_default_value_fields=True,
         )
+
+    def get_status(self, timeout: float) -> dict:
+        """Call Device.Handle(Request(get_status={})) and return the full dict."""
+        return self.call('get_status', timeout)
+
+    def get_history(self, timeout: float) -> dict:
+        """Call Device.Handle(Request(get_history={})) and return the full dict."""
+        return self.call('get_history', timeout)
 
 
 # ---- Descriptor cache ----
