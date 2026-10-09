@@ -257,6 +257,24 @@ class TestDeviceCallerFromFds:
         assert caller is not None
         channel.close()
 
+    def test_from_fds_copies_well_known_imports_with_their_own_imports(self):
+        """type.proto imports any.proto and source_context.proto; all must be copied."""
+        import grpc
+        fds = descriptor_pb2.FileDescriptorSet()
+        fds.ParseFromString(self._make_minimal_fds())
+        device = fds.file[1]
+        device.dependency.append('google/protobuf/type.proto')
+        f = device.message_type[1].nested_type[0].field.add()
+        f.name = 'kind'
+        f.number = 1
+        f.type = descriptor_pb2.FieldDescriptorProto.TYPE_MESSAGE
+        f.type_name = '.google.protobuf.Type'
+        f.label = descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL
+        channel = grpc.insecure_channel('localhost:1')
+        caller = DeviceCaller.from_fds(fds.SerializeToString(), channel)
+        assert caller is not None
+        channel.close()
+
     def test_supports_reports_missing_requests(self):
         """supports()/call() tell 'firmware has no such request' from an RPC failure."""
         import grpc

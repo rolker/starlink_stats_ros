@@ -22,9 +22,15 @@ from collections import deque
 from pathlib import Path
 from typing import Optional
 
+# The well-known types are registered in the default pool only once their
+# _pb2 module has been imported; from_fds copies them from there.
+from google.protobuf import any_pb2, api_pb2, duration_pb2  # noqa: F401
 from google.protobuf import descriptor_pb2
 from google.protobuf import descriptor_pool
+from google.protobuf import empty_pb2, field_mask_pb2  # noqa: F401
 from google.protobuf import message_factory
+from google.protobuf import source_context_pb2, struct_pb2  # noqa: F401
+from google.protobuf import timestamp_pb2, type_pb2, wrappers_pb2  # noqa: F401
 from google.protobuf.json_format import MessageToDict, ParseDict
 import grpc
 
@@ -312,14 +318,23 @@ class DeviceCaller:
         # where the protobuf runtime has them preloaded.
         default_pool = descriptor_pool.Default()
         copied: set[str] = set()
+
+        def copy_with_deps(name: str) -> None:
+            # Dependencies first: a pool refuses a file whose imports it
+            # does not yet hold (type.proto imports any.proto, ...).
+            if name in served or name in copied:
+                return
+            file_desc = default_pool.FindFileByName(name)
+            for dep in file_desc.dependencies:
+                copy_with_deps(dep.name)
+            dep_proto = descriptor_pb2.FileDescriptorProto()
+            file_desc.CopyToProto(dep_proto)
+            pool.Add(dep_proto)
+            copied.add(name)
+
         for fdp in fds.file:
             for dep in fdp.dependency:
-                if dep in served or dep in copied:
-                    continue
-                dep_proto = descriptor_pb2.FileDescriptorProto()
-                default_pool.FindFileByName(dep).CopyToProto(dep_proto)
-                pool.Add(dep_proto)
-                copied.add(dep)
+                copy_with_deps(dep)
         for fdp in fds.file:
             pool.Add(fdp)
 
