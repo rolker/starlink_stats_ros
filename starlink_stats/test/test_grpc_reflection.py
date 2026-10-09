@@ -207,15 +207,135 @@ class TestDeviceCallerFromFds:
         assert caller._response_class is not None
         channel.close()
 
-    def test_from_fds_uses_default_pool(self):
-        """Verify from_fds uses the default pool (well-known types available)."""
+    def test_from_fds_builds_twice(self):
+        """Building from the same descriptors twice succeeds."""
         import grpc
         channel = grpc.insecure_channel('localhost:1')
         fds_bytes = self._make_minimal_fds()
-        # Building twice should succeed — Default() pool tolerates re-adds
-        # of the same descriptors via the duplicate check.
         caller1 = DeviceCaller.from_fds(fds_bytes, channel)
         caller2 = DeviceCaller.from_fds(fds_bytes, channel)
         assert caller1 is not None
         assert caller2 is not None
         channel.close()
+
+    def test_from_fds_accepts_a_changed_schema_under_the_same_name(self):
+        """
+        A firmware update can change the schema without renaming its files.
+
+        Regression: descriptors used to go into the process-wide default pool,
+        which raised on the second, different file of the same name.
+        """
+        import grpc
+        from fake_dish import build_fds
+        channel = grpc.insecure_channel('localhost:1')
+        before = DeviceCaller.from_fds(build_fds(), channel)
+        after = DeviceCaller.from_fds(
+            build_fds(extra_status_field='new_firmware_field'), channel)
+        status_before = before._response_class.DESCRIPTOR.fields_by_name[
+            'dish_get_status'].message_type
+        status_after = after._response_class.DESCRIPTOR.fields_by_name[
+            'dish_get_status'].message_type
+        assert 'new_firmware_field' not in status_before.fields_by_name
+        assert 'new_firmware_field' in status_after.fields_by_name
+        channel.close()
+
+    def test_from_fds_copies_well_known_imports(self):
+        """A schema importing a well-known type that reflection did not serve builds."""
+        import grpc
+        fds = descriptor_pb2.FileDescriptorSet()
+        fds.ParseFromString(self._make_minimal_fds())
+        device = fds.file[1]
+        device.dependency.append('google/protobuf/timestamp.proto')
+        f = device.message_type[1].nested_type[0].field.add()
+        f.name = 'when'
+        f.number = 1
+        f.type = descriptor_pb2.FieldDescriptorProto.TYPE_MESSAGE
+        f.type_name = '.google.protobuf.Timestamp'
+        f.label = descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL
+        channel = grpc.insecure_channel('localhost:1')
+        caller = DeviceCaller.from_fds(fds.SerializeToString(), channel)
+        assert caller is not None
+        channel.close()
+
+    def test_from_fds_copies_well_known_imports_with_their_own_imports(self):
+        """type.proto imports any.proto and source_context.proto; all must be copied."""
+        import grpc
+        fds = descriptor_pb2.FileDescriptorSet()
+        fds.ParseFromString(self._make_minimal_fds())
+        device = fds.file[1]
+        device.dependency.append('google/protobuf/type.proto')
+        f = device.message_type[1].nested_type[0].field.add()
+        f.name = 'kind'
+        f.number = 1
+        f.type = descriptor_pb2.FieldDescriptorProto.TYPE_MESSAGE
+        f.type_name = '.google.protobuf.Type'
+        f.label = descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL
+        channel = grpc.insecure_channel('localhost:1')
+        caller = DeviceCaller.from_fds(fds.SerializeToString(), channel)
+        assert caller is not None
+        channel.close()
+
+    def test_from_fds_mixes_served_and_copied_well_known_files(self):
+        """
+        The dish serves any.proto (listed last) but not type.proto, which imports it.
+
+        Every file must still land in the pool after its imports.
+        """
+        import grpc
+        from google.protobuf import any_pb2
+        fds = descriptor_pb2.FileDescriptorSet()
+        fds.ParseFromString(self._make_minimal_fds())
+        device = fds.file[1]
+        device.dependency.append('google/protobuf/type.proto')
+        f = device.message_type[1].nested_type[0].field.add()
+        f.name = 'kind'
+        f.number = 1
+        f.type = descriptor_pb2.FieldDescriptorProto.TYPE_MESSAGE
+        f.type_name = '.google.protobuf.Type'
+        f.label = descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL
+        any_proto = fds.file.add()
+        any_pb2.DESCRIPTOR.CopyToProto(any_proto)
+        channel = grpc.insecure_channel('localhost:1')
+        caller = DeviceCaller.from_fds(fds.SerializeToString(), channel)
+        assert caller is not None
+        channel.close()
+
+    def test_supports_reports_missing_requests(self):
+        """supports()/call() tell 'firmware has no such request' from an RPC failure."""
+        import grpc
+        import pytest
+        from fake_dish import build_fds
+        channel = grpc.insecure_channel('localhost:1')
+        with_hist = DeviceCaller.from_fds(build_fds(), channel)
+        without = DeviceCaller.from_fds(build_fds(with_history=False), channel)
+        assert with_hist.supports('get_history')
+        assert not without.supports('get_history')
+        with pytest.raises(KeyError):
+            without.get_history(timeout=0.1)
+        channel.close()
+
+
+# --- DeviceCaller against a running fake dish ---
+
+class TestDeviceCallerLive:
+    """Reflect and call a local fake dish over real gRPC."""
+
+    def test_reflect_status_and_history(self):
+        import grpc
+        from fake_dish import FakeDish
+        from starlink_stats.grpc_reflection import reflect
+        dish = FakeDish().start()
+        try:
+            channel = grpc.insecure_channel(dish.address)
+            caller = DeviceCaller.from_fds(reflect(channel, timeout=5.0), channel)
+            status = caller.get_status(timeout=5.0)['dish_get_status']
+            assert status['device_info']['hardware_version'] == 'mini1_prod2'
+            assert status['gps_stats']['gps_valid'] is True
+            assert 'state' not in status
+            history = caller.get_history(timeout=5.0)['dish_get_history']
+            assert history['current'] == '1234'
+            assert len(history['power_in']) == 900
+            assert dish.requests == {'get_status': 1, 'get_history': 1}
+            channel.close()
+        finally:
+            dish.stop()
