@@ -275,6 +275,31 @@ class TestDeviceCallerFromFds:
         assert caller is not None
         channel.close()
 
+    def test_from_fds_mixes_served_and_copied_well_known_files(self):
+        """
+        The dish serves any.proto (listed last) but not type.proto, which imports it.
+
+        Every file must still land in the pool after its imports.
+        """
+        import grpc
+        from google.protobuf import any_pb2
+        fds = descriptor_pb2.FileDescriptorSet()
+        fds.ParseFromString(self._make_minimal_fds())
+        device = fds.file[1]
+        device.dependency.append('google/protobuf/type.proto')
+        f = device.message_type[1].nested_type[0].field.add()
+        f.name = 'kind'
+        f.number = 1
+        f.type = descriptor_pb2.FieldDescriptorProto.TYPE_MESSAGE
+        f.type_name = '.google.protobuf.Type'
+        f.label = descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL
+        any_proto = fds.file.add()
+        any_pb2.DESCRIPTOR.CopyToProto(any_proto)
+        channel = grpc.insecure_channel('localhost:1')
+        caller = DeviceCaller.from_fds(fds.SerializeToString(), channel)
+        assert caller is not None
+        channel.close()
+
     def test_supports_reports_missing_requests(self):
         """supports()/call() tell 'firmware has no such request' from an RPC failure."""
         import grpc

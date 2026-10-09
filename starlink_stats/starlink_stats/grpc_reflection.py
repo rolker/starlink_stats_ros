@@ -310,33 +310,32 @@ class DeviceCaller:
         """
         fds = descriptor_pb2.FileDescriptorSet()
         fds.ParseFromString(fds_bytes)
-        served = {fdp.name for fdp in fds.file}
+        served = {fdp.name: fdp for fdp in fds.file}
 
         pool = descriptor_pool.DescriptorPool()
         # Well-known types (google/protobuf/*.proto) may not be served by
-        # reflection; copy any the schema imports from the default pool,
-        # where the protobuf runtime has them preloaded.
+        # reflection; any the schema imports are copied from the default
+        # pool, where the protobuf runtime has them preloaded. One pass adds
+        # every file after its imports, served or copied, whatever order the
+        # dish sent them in: a pool refuses a file whose imports it does not
+        # yet hold (type.proto imports any.proto, ...).
         default_pool = descriptor_pool.Default()
-        copied: set[str] = set()
+        added: set[str] = set()
 
-        def copy_with_deps(name: str) -> None:
-            # Dependencies first: a pool refuses a file whose imports it
-            # does not yet hold (type.proto imports any.proto, ...).
-            if name in served or name in copied:
+        def add_with_deps(name: str) -> None:
+            if name in added:
                 return
-            file_desc = default_pool.FindFileByName(name)
-            for dep in file_desc.dependencies:
-                copy_with_deps(dep.name)
-            dep_proto = descriptor_pb2.FileDescriptorProto()
-            file_desc.CopyToProto(dep_proto)
-            pool.Add(dep_proto)
-            copied.add(name)
-
-        for fdp in fds.file:
+            added.add(name)
+            fdp = served.get(name)
+            if fdp is None:
+                fdp = descriptor_pb2.FileDescriptorProto()
+                default_pool.FindFileByName(name).CopyToProto(fdp)
             for dep in fdp.dependency:
-                copy_with_deps(dep)
-        for fdp in fds.file:
+                add_with_deps(dep)
             pool.Add(fdp)
+
+        for name in served:
+            add_with_deps(name)
 
         factory = message_factory.MessageFactory(pool=pool)
         req_desc = pool.FindMessageTypeByName(_REQUEST_TYPE)
