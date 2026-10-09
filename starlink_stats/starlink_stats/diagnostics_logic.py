@@ -87,7 +87,6 @@ CURATED_KEYS: dict[str, list[str]] = {
     'state': [
         'state',
         'device_state.uptime_s',
-        'seconds_to_first_nonempty_slot',
     ],
     'link': [
         'pop_ping_drop_rate',
@@ -113,6 +112,12 @@ CURATED_KEYS: dict[str, list[str]] = {
         'alerts.power_supply_thermal_throttle',
     ],
     'alerts': [],  # populated dynamically from active alerts
+    'pointing': [
+        'gps_stats.gps_valid',
+        'gps_stats.gps_sats',
+        'alignment_stats.tilt_angle_deg',
+        'alignment_stats.attitude_uncertainty_deg',
+    ],
 }
 
 
@@ -185,7 +190,10 @@ def diagnose_state(
     """
     state = status.get('state')
     if state is None:
-        return DiagnosticStatus.OK, 'state not reported by dish', []
+        # Some dishes (the Mini on 2026.08 firmware) report no `state` field.
+        # Fall back to the subsystem ready flags.
+        level, msg = diagnose_readiness(status)
+        return level, msg, []
     state_str = str(state)
     known = set(known_states)
     if state_str not in known:
@@ -193,6 +201,23 @@ def diagnose_state(
         return DiagnosticStatus.WARN, f'unknown dish state: {state_str}', new
     level = STATE_LEVEL_MAP.get(state_str, DiagnosticStatus.WARN)
     return level, f'state={state_str}', []
+
+
+def diagnose_readiness(status: dict) -> tuple[int, str]:
+    """
+    Diagnose the dish from its subsystem ready flags (``ready_states``).
+
+    Used when the dish reports no ``state``. A flag that is false means that
+    subsystem has not come up. Readiness is not the same as connectivity:
+    the link task's ping drop rate says whether traffic is getting through.
+    """
+    ready = status.get('ready_states')
+    if not isinstance(ready, dict) or not ready:
+        return DiagnosticStatus.OK, 'state not reported by dish'
+    not_ready = sorted(k for k, v in ready.items() if v is False)
+    if not_ready:
+        return DiagnosticStatus.WARN, 'not ready: ' + ', '.join(not_ready)
+    return DiagnosticStatus.OK, 'all subsystems ready'
 
 
 def diagnose_link(
@@ -267,6 +292,51 @@ def diagnose_obstruction(status: dict, thresholds: Thresholds) -> tuple[int, str
     if currently:
         msg += ' (currently)'
     return level, msg
+
+
+def diagnose_pointing(status: dict) -> tuple[int, str]:
+    """
+    Diagnose the dish's own GPS fix, and report its tilt.
+
+    WARN when the dish reports no GPS fix. Tilt and attitude uncertainty are
+    reported without thresholds until logs show what normal looks like.
+    """
+    gps = status.get('gps_stats')
+    level = DiagnosticStatus.OK
+    bits: list[str] = []
+    if isinstance(gps, dict) and 'gps_valid' in gps:
+        if gps.get('gps_valid'):
+            sats = gps.get('gps_sats')
+            bits.append(f'GPS fix ({sats} sats)' if sats is not None else 'GPS fix')
+        else:
+            level = DiagnosticStatus.WARN
+            bits.append('no dish GPS fix')
+    tilt = get_dotted(status, 'alignment_stats.tilt_angle_deg')
+    if isinstance(tilt, (int, float)):
+        bits.append(f'tilt {tilt:.1f} deg')
+    return level, ', '.join(bits) if bits else 'GPS and pointing data unavailable'
+
+
+def latest_history_value(history: Optional[dict], field: str) -> Optional[float]:
+    """
+    Return the newest sample of ``field`` from a ``dish_get_history`` dict.
+
+    The history arrays are a ring buffer; ``current`` counts samples written
+    so far, so the newest one is at ``(current - 1) % len(array)``. (That
+    reading of ``current`` follows community tools and is unverified against
+    this firmware.) Returns None when the field or counter is missing.
+    """
+    if not isinstance(history, dict):
+        return None
+    values = history.get(field)
+    try:
+        current = int(history.get('current'))
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(values, list) or not values or current <= 0:
+        return None
+    value = values[(current - 1) % len(values)]
+    return float(value) if isinstance(value, (int, float)) else None
 
 
 def diagnose_thermal(status: dict) -> tuple[int, str]:

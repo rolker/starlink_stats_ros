@@ -19,10 +19,13 @@ from starlink_stats.diagnostics_logic import (
     diagnose_alerts,
     diagnose_link,
     diagnose_obstruction,
+    diagnose_pointing,
+    diagnose_readiness,
     diagnose_state,
     diagnose_thermal,
     flatten,
     get_dotted,
+    latest_history_value,
     STATE_LEVEL_MAP,
     THERMAL_ALERTS,
     Thresholds,
@@ -491,6 +494,7 @@ class TestSparseSchemas:
         assert diagnose_obstruction(empty, Thresholds())[0] == OK
         assert diagnose_thermal(empty)[0] == OK
         assert diagnose_alerts(empty, ALERT_LEVEL_MAP.keys(), set())[0] == OK
+        assert diagnose_pointing(empty)[0] == OK
 
     def test_state_with_link_metrics_but_no_state(self):
         """Dish reports link quality but not state enum — state task is OK."""
@@ -523,3 +527,87 @@ class TestSparseSchemas:
         )
         assert level == OK
         assert active == []
+
+
+# --- Readiness fallback (dishes with no `state` field, e.g. the Mini) ---
+
+ALL_READY = {'cady': True, 'scp': True, 'l1l2': True,
+             'xphy': True, 'aap': True, 'rf': True}
+
+
+def test_state_falls_back_to_ready_flags_all_ready():
+    level, msg, _ = diagnose_state(
+        {'ready_states': ALL_READY}, STATE_LEVEL_MAP.keys(), set())
+    assert level == OK
+    assert msg == 'all subsystems ready'
+
+
+def test_state_falls_back_to_ready_flags_names_the_unready():
+    ready = dict(ALL_READY, rf=False, l1l2=False)
+    level, msg, _ = diagnose_state(
+        {'ready_states': ready}, STATE_LEVEL_MAP.keys(), set())
+    assert level == WARN
+    assert msg == 'not ready: l1l2, rf'
+
+
+def test_state_field_wins_over_ready_flags():
+    """A dish that reports `state` keeps the original behaviour."""
+    level, msg, _ = diagnose_state(
+        {'state': 'CONNECTED', 'ready_states': dict(ALL_READY, rf=False)},
+        STATE_LEVEL_MAP.keys(), set())
+    assert level == OK
+    assert msg == 'state=CONNECTED'
+
+
+def test_readiness_ignores_non_bool_and_empty():
+    assert diagnose_readiness({'ready_states': {}})[0] == OK
+    assert diagnose_readiness({'ready_states': 'garbage'})[0] == OK
+    assert diagnose_readiness({'ready_states': {'rf': None}})[0] == OK
+
+
+# --- Pointing / dish GPS ---
+
+def test_pointing_fix_and_tilt():
+    level, msg = diagnose_pointing({
+        'gps_stats': {'gps_valid': True, 'gps_sats': 14},
+        'alignment_stats': {'tilt_angle_deg': 3.46},
+    })
+    assert level == OK
+    assert msg == 'GPS fix (14 sats), tilt 3.5 deg'
+
+
+def test_pointing_no_fix_warns():
+    level, msg = diagnose_pointing({'gps_stats': {'gps_valid': False, 'gps_sats': 0}})
+    assert level == WARN
+    assert 'no dish GPS fix' in msg
+
+
+def test_pointing_missing_data_is_ok():
+    level, msg = diagnose_pointing({'gps_stats': {}})
+    assert level == OK
+    assert 'unavailable' in msg
+
+
+# --- History ring buffer ---
+
+def test_latest_history_value_reads_newest_sample():
+    values = [1.0] * 900
+    values[(1234 - 1) % 900] = 77.5
+    assert latest_history_value({'current': '1234', 'power_in': values},
+                                'power_in') == 77.5
+
+
+def test_latest_history_value_wraps_at_buffer_start():
+    values = [1.0] * 900
+    values[899] = 9.0  # current=900: newest sample is the last slot
+    assert latest_history_value({'current': '900', 'power_in': values},
+                                'power_in') == 9.0
+
+
+def test_latest_history_value_missing_or_bad():
+    assert latest_history_value(None, 'power_in') is None
+    assert latest_history_value({'power_in': [1.0]}, 'power_in') is None
+    assert latest_history_value({'current': '0', 'power_in': [1.0]}, 'power_in') is None
+    assert latest_history_value({'current': 'x', 'power_in': [1.0]}, 'power_in') is None
+    assert latest_history_value({'current': '5', 'power_in': []}, 'power_in') is None
+    assert latest_history_value({'current': '5', 'power_in': ['NaN']}, 'power_in') is None
