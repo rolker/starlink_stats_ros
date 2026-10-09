@@ -4,8 +4,9 @@
 
 ROS 2 node that connects to a Starlink dish via gRPC, queries its diagnostic
 status, and publishes it as a `diagnostic_msgs/DiagnosticArray` at a steady
-1 Hz cadence. Uses `diagnostic_updater` with six named tasks (comms, state,
-link, obstruction, thermal, alerts).
+1 Hz cadence. Uses `diagnostic_updater` with seven named tasks (comms, state,
+link, obstruction, thermal, alerts, pointing). Optionally publishes the dish's
+full status and history buffer as JSON, for recording.
 
 ## Prerequisites
 
@@ -46,8 +47,54 @@ Key parameters (all configurable via launch args):
 - `dish_address` — gRPC address (default `192.168.100.1:9200`)
 - `hardware_id` — suffix for diagnostic names (default: auto-detected from dish)
 - `poll_rate` — status polling rate in Hz (default `1.0`)
-- `dump_all_fields` — include full flattened response as KeyValues (default `false`)
+- `dump_all_fields` — include full flattened response as KeyValues (default `false`).
+  The dump is appended to every task, so it repeats seven times per update.
 - `stale_timeout_sec` — age beyond which cached status is STALE (default `5.0`)
+- `publish_telemetry` — publish the telemetry topics below (default `false`)
+- `history_period_sec` — seconds between history-buffer fetches, `0` disables
+  (default `300.0`; the dish keeps about 15 minutes)
+
+## Diagnostics
+
+- **state** — the dish's `state` field when it reports one. Some dishes (the
+  Mini on 2026.08 firmware) do not; the task then reports the subsystem ready
+  flags (`ready_states`), WARNing with the names of any not ready. Also carries
+  `power_in_w`, the dish's newest input power from the history buffer, and
+  `power_in_age_s`.
+- **link** — ping drop rate and latency to the Starlink PoP, SNR flags.
+- **obstruction**, **thermal**, **alerts** — as reported by the dish.
+- **pointing** — the dish's own GPS fix (WARN with none) and satellite count,
+  tilt and attitude uncertainty. No thresholds on tilt yet.
+- **comms** — whether the node is reaching the dish.
+
+## Telemetry topics
+
+With `publish_telemetry: true`:
+
+| Topic | Type | Rate |
+|---|---|---|
+| `~/status_json` | `std_msgs/String` | every successful status poll |
+| `~/history_json` | `std_msgs/String` | every history fetch |
+
+Each message is `{"query_time_utc": ..., "response": {...}}`: the time the
+dish answered, and its full response rendered from the reflected schema, so
+new firmware fields appear without a code change. These are for bags on the
+boat. Each status message carries every field the dish reports (its size
+depends on the firmware), once per poll; don't forward them over a
+bandwidth-limited link.
+
+The history arrays are a ring buffer: `current` counts samples written, so
+the newest is at index `(current - 1) % len(array)`. That reading follows
+community tools and has not been checked against this firmware.
+
+## Tests
+
+`colcon test` runs everything without a dish. `test/fake_dish.py` is a local
+gRPC server with reflection and a stand-in schema; the node is tested
+against it end to end (polling, history, telemetry topics, diagnostics,
+firmware changes). The stand-in is not the dish's real schema. When a
+descriptor set is captured from a dish (the node caches one under
+`~/.cache/starlink_stats/`), the fake should serve that instead.
 
 ## Notes
 
