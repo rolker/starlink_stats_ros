@@ -16,9 +16,10 @@ out due to a slow or hung gRPC call. Staleness is reported in-band via
 
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import json
 import threading
 import time
 from typing import Optional
@@ -36,22 +37,58 @@ from starlink_stats.diagnostics_logic import (
     diagnose_alerts,
     diagnose_link,
     diagnose_obstruction,
+    diagnose_pointing,
     diagnose_state,
     diagnose_thermal,
     flatten,
     get_dotted,
+    latest_history_value,
     STATE_LEVEL_MAP,
     Thresholds,
 )
 from starlink_stats.grpc_reflection import (
+    cached_firmware_version,
     DeviceCaller,
     load_cached_fds,
     reflect,
     save_cached_fds,
 )
+from std_msgs.msg import String
 
 
 DISH_GET_STATUS_KEY = 'dish_get_status'
+DISH_GET_HISTORY_KEY = 'dish_get_history'
+
+# After a failed history fetch, retry sooner than a full period.
+_HISTORY_RETRY_SEC = 30.0
+
+
+class HistoryUnsupported(Exception):
+    """The dish's reflected schema has no get_history request."""
+
+
+def telemetry_json(response: dict, query_time_utc: str) -> str:
+    """
+    Wrap a full dish response for the telemetry topics.
+
+    ``query_time_utc`` is when the dish answered, which can be a second or
+    more before the message reaches a bag. The response is passed through as
+    the dish's reflected schema rendered it, so firmware changes need no
+    change here.
+    """
+    return json.dumps(
+        {'query_time_utc': query_time_utc, 'response': response},
+        separators=(',', ':'),
+        allow_nan=True,
+    )
+
+
+@dataclass
+class CachedHistory:
+    """Newest dish input power from the last successful history fetch."""
+
+    power_in_w: Optional[float] = None
+    fetch_monotonic: float = 0.0
 
 
 @dataclass
@@ -85,8 +122,8 @@ class StarlinkDiagnosticsNode(Node):
     _BACKOFF_CAP_EXP = 6
     _BACKOFF_MAX_SEC = 60.0
 
-    def __init__(self):
-        super().__init__('starlink_diagnostics')
+    def __init__(self, **kwargs):
+        super().__init__('starlink_diagnostics', **kwargs)
 
         # Parameters
         self.declare_parameter('dish_address', '192.168.100.1:9200')
@@ -103,6 +140,8 @@ class StarlinkDiagnosticsNode(Node):
         self.declare_parameter('ping_latency_error_ms', 500.0)
         self.declare_parameter('snr_warn_db', 9.0)
         self.declare_parameter('dump_all_fields', False)
+        self.declare_parameter('publish_telemetry', False)
+        self.declare_parameter('history_period_sec', 300.0)
 
         self.dish_address = self.get_parameter('dish_address').value
         poll_rate = float(self.get_parameter('poll_rate').value)
@@ -112,6 +151,9 @@ class StarlinkDiagnosticsNode(Node):
         # type. No bool() cast here because bool('false') == True would be
         # a silent bug if a non-bool value ever slipped through.
         self.dump_all_fields = self.get_parameter('dump_all_fields').value
+        self.publish_telemetry = self.get_parameter('publish_telemetry').value
+        self.history_period_sec = float(
+            self.get_parameter('history_period_sec').value)
 
         def _p(name: str) -> float:
             return float(self.get_parameter(name).value)
@@ -142,6 +184,24 @@ class StarlinkDiagnosticsNode(Node):
         self._schema_logged = False
         self._known_firmware: Optional[str] = None
         self._fds_needs_save = False
+        self._caller_from_cache = False
+
+        # History buffer: fetched every history_period_sec (0 disables) on
+        # the same gRPC worker as the status poll. Due immediately, so the
+        # first fetch follows the first successful status poll.
+        self._history = CachedHistory()
+        self._history_in_flight = False
+        self._history_due_monotonic = 0.0
+        self._history_unsupported = False
+
+        # Telemetry topics: the full status and history as JSON, for the
+        # record. Off by default; they are large next to /diagnostics and
+        # meant to be bagged on the boat, not forwarded over a radio link.
+        self._status_pub = None
+        self._history_pub = None
+        if self.publish_telemetry:
+            self._status_pub = self.create_publisher(String, '~/status_json', 10)
+            self._history_pub = self.create_publisher(String, '~/history_json', 10)
 
         # gRPC runs on a single-worker background thread so a slow or hung
         # call never blocks the rclpy executor (and therefore the Updater's
@@ -171,6 +231,7 @@ class StarlinkDiagnosticsNode(Node):
         self._updater.add(f'{self._name_prefix}: obstruction', self._task_obstruction)
         self._updater.add(f'{self._name_prefix}: thermal', self._task_thermal)
         self._updater.add(f'{self._name_prefix}: alerts', self._task_alerts)
+        self._updater.add(f'{self._name_prefix}: pointing', self._task_pointing)
 
         # Poll timer — independent of Updater period.
         self._connect()
@@ -181,6 +242,9 @@ class StarlinkDiagnosticsNode(Node):
             f'Starlink diagnostics node started, polling {self.dish_address} '
             f'at {poll_rate} Hz (grpc_timeout={self.grpc_timeout_sec}s)'
             + (f', hardware_id={self.hardware_id}' if self.hardware_id else '')
+            + (f', history every {self.history_period_sec:g}s'
+               if self.history_period_sec > 0 else ', history off')
+            + (', publishing telemetry' if self.publish_telemetry else '')
         )
 
     # --- gRPC channel management ---
@@ -234,6 +298,31 @@ class StarlinkDiagnosticsNode(Node):
             self.get_logger().warning(
                 f'Failed to schedule Starlink gRPC poll: {exc}'
             )
+            return
+
+        self._maybe_schedule_history(cache, now_mono)
+
+    def _maybe_schedule_history(self, cache: 'CachedStatus', now_mono: float):
+        """Queue a history fetch behind the status poll when one is due."""
+        if (
+            self.history_period_sec <= 0
+            or self._history_unsupported
+            or cache.status is None
+            or now_mono < self._history_due_monotonic
+        ):
+            return
+        with self._poll_lock:
+            if self._history_in_flight:
+                return
+            self._history_in_flight = True
+        try:
+            future = self._grpc_executor.submit(self._blocking_history)
+            future.add_done_callback(self._handle_history_result)
+        except Exception as exc:  # pragma: no cover - executor shutdown
+            with self._poll_lock:
+                self._history_in_flight = False
+            self.get_logger().warning(
+                f'Failed to schedule Starlink history fetch: {exc}')
 
     def _ensure_device_caller(self) -> DeviceCaller:
         """Build a DeviceCaller, reflecting if needed. Runs on the gRPC thread."""
@@ -245,6 +334,7 @@ class StarlinkDiagnosticsNode(Node):
             try:
                 caller = DeviceCaller.from_fds(fds_bytes, self._channel)
                 self._device_caller = caller
+                self._caller_from_cache = True
                 self.get_logger().info('Using cached proto descriptors')
                 return caller
             except (DecodeError, KeyError, TypeError, ValueError) as exc:
@@ -259,6 +349,7 @@ class StarlinkDiagnosticsNode(Node):
         caller = DeviceCaller.from_fds(fds_bytes, self._channel)
         self._cached_fds = fds_bytes
         self._device_caller = caller
+        self._caller_from_cache = False
         self.get_logger().info('Reflection complete')
         return caller
 
@@ -267,8 +358,49 @@ class StarlinkDiagnosticsNode(Node):
         caller = self._ensure_device_caller()
         full = caller.get_status(timeout=self.grpc_timeout_sec)
         now_mono = time.monotonic()
-        now_iso = datetime.now(timezone.utc).isoformat(timespec='seconds')
+        now_iso = datetime.now(timezone.utc).isoformat(timespec='milliseconds')
         return full, now_mono, now_iso
+
+    def _blocking_history(self) -> tuple[dict, float, str]:
+        """Fetch the dish's history buffer. Runs on the gRPC worker thread."""
+        caller = self._ensure_device_caller()
+        if not caller.supports('get_history'):
+            raise HistoryUnsupported()
+        full = caller.get_history(timeout=self.grpc_timeout_sec)
+        now_mono = time.monotonic()
+        now_iso = datetime.now(timezone.utc).isoformat(timespec='milliseconds')
+        return full, now_mono, now_iso
+
+    def _handle_history_result(self, future: Future):
+        """Done-callback for a history fetch, on the gRPC worker thread."""
+        try:
+            try:
+                full, now_mono, now_iso = future.result()
+            except CancelledError:
+                return  # node shutting down
+            except HistoryUnsupported:
+                self._history_unsupported = True
+                self.get_logger().warning(
+                    'Starlink: dish schema has no get_history; history disabled')
+                return
+            except Exception as exc:
+                self._history_due_monotonic = time.monotonic() + min(
+                    self.history_period_sec, _HISTORY_RETRY_SEC)
+                self.get_logger().warning(
+                    f'Starlink history fetch failed: {exc!r}',
+                    throttle_duration_sec=60.0)
+                return
+            self._history_due_monotonic = now_mono + self.history_period_sec
+            history = full.get(DISH_GET_HISTORY_KEY)
+            self._history = CachedHistory(
+                power_in_w=latest_history_value(history, 'power_in'),
+                fetch_monotonic=now_mono,
+            )
+            if self._history_pub is not None:
+                self._history_pub.publish(String(data=telemetry_json(full, now_iso)))
+        finally:
+            with self._poll_lock:
+                self._history_in_flight = False
 
     def _handle_poll_result(self, future: Future):
         """Done-callback on the gRPC worker thread. Swaps the cache atomically."""
@@ -333,6 +465,8 @@ class StarlinkDiagnosticsNode(Node):
                 error_message=None,
                 first_searching_monotonic=first_search,
             )
+            if self._status_pub is not None:
+                self._status_pub.publish(String(data=telemetry_json(full, now_iso)))
 
             # --- Schema fingerprint and firmware change detection ---
             if isinstance(status, dict):
@@ -367,6 +501,23 @@ class StarlinkDiagnosticsNode(Node):
                         self._device_caller = None
                         self._cached_fds = None
                         self._fds_needs_save = True
+                        self._history_unsupported = False
+                    elif (
+                        self._caller_from_cache
+                        and cached_firmware_version() != sw
+                    ):
+                        # First poll, on descriptors cached under different
+                        # firmware (e.g. updated while the node was down):
+                        # re-reflect rather than keep the old schema.
+                        self.get_logger().info(
+                            f'Cached descriptors are from firmware '
+                            f'{cached_firmware_version()}, dish runs {sw}; '
+                            f'will re-reflect on next poll'
+                        )
+                        self._device_caller = None
+                        self._cached_fds = None
+                        self._fds_needs_save = True
+                        self._history_unsupported = False
                     else:
                         # First poll — save current descriptors.
                         if self._cached_fds is not None:
@@ -500,6 +651,11 @@ class StarlinkDiagnosticsNode(Node):
             self.get_logger().warning(f'Starlink: unknown status.state value: {name}')
         stat.summary(level, msg)
         self._apply_common_kv(stat, cache, 'state')
+        history = self._history
+        if history.power_in_w is not None:
+            stat.add('power_in_w', f'{history.power_in_w:.1f}')
+            stat.add('power_in_age_s',
+                     f'{time.monotonic() - history.fetch_monotonic:.0f}')
         return stat
 
     def _task_link(self, stat):
@@ -532,6 +688,15 @@ class StarlinkDiagnosticsNode(Node):
         level, msg = diagnose_thermal(cache.status)
         stat.summary(level, msg)
         self._apply_common_kv(stat, cache, 'thermal')
+        return stat
+
+    def _task_pointing(self, stat):
+        cache = self._cache
+        if self._short_circuit_stale(stat, cache, 'pointing'):
+            return stat
+        level, msg = diagnose_pointing(cache.status)
+        stat.summary(level, msg)
+        self._apply_common_kv(stat, cache, 'pointing')
         return stat
 
     def _task_alerts(self, stat):

@@ -72,6 +72,17 @@ def generate_launch_description():
             'dump_all_fields', default_value='false',
             description='If true, append a full flattened dump of the response as KeyValues.',
         ),
+        DeclareLaunchArgument(
+            'publish_telemetry', default_value='false',
+            description=(
+                'If true, publish the full status and history as JSON on '
+                '~/status_json and ~/history_json, for recording.'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'history_period_sec', default_value='300.0',
+            description='Seconds between history-buffer fetches (0 disables).',
+        ),
     ]
 
     # LaunchConfiguration always yields string substitutions. ROS 2 coerces
@@ -79,7 +90,7 @@ def generate_launch_description():
     # params must be delivered with an explicit ParameterValue type.
     def _param(arg_name):
         cfg = LaunchConfiguration(arg_name)
-        if arg_name == 'dump_all_fields':
+        if arg_name in ('dump_all_fields', 'publish_telemetry'):
             return ParameterValue(cfg, value_type=bool)
         return cfg
 
