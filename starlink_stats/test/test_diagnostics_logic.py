@@ -611,3 +611,25 @@ def test_latest_history_value_missing_or_bad():
     assert latest_history_value({'current': 'x', 'power_in': [1.0]}, 'power_in') is None
     assert latest_history_value({'current': '5', 'power_in': []}, 'power_in') is None
     assert latest_history_value({'current': '5', 'power_in': ['NaN']}, 'power_in') is None
+
+
+def test_latest_history_value_skips_a_nan_newest_sample():
+    values = [1.0] * 900
+    values[(1234 - 2) % 900] = 66.0
+    values[(1234 - 1) % 900] = 'NaN'
+    assert latest_history_value({'current': '1234', 'power_in': values},
+                                'power_in') == 66.0
+
+
+def test_latest_history_value_gives_up_after_max_back():
+    values = ['NaN'] * 900
+    values[0] = 5.0
+    assert latest_history_value({'current': '900', 'power_in': values},
+                                'power_in', max_back=10) is None
+
+
+def test_pointing_inhibited_gps_is_not_a_fault():
+    level, msg = diagnose_pointing({'gps_stats': {
+        'gps_valid': False, 'gps_sats': 0, 'inhibit_gps': True}})
+    assert level == OK
+    assert 'inhibited' in msg

@@ -52,7 +52,9 @@ Key parameters (all configurable via launch args):
 - `stale_timeout_sec` — age beyond which cached status is STALE (default `5.0`)
 - `publish_telemetry` — publish the telemetry topics below (default `false`)
 - `history_period_sec` — seconds between history-buffer fetches, `0` disables
-  (default `300.0`; the dish keeps about 15 minutes)
+  (default `300.0`; the dish keeps about 15 minutes). A fetch shares the
+  status poll's worker and `grpc_timeout_sec`; it is skipped while the dish
+  is unreachable and retried 30 s after a failure.
 
 ## Diagnostics
 
@@ -60,11 +62,13 @@ Key parameters (all configurable via launch args):
   Mini on 2026.08 firmware) do not; the task then reports the subsystem ready
   flags (`ready_states`), WARNing with the names of any not ready. Also carries
   `power_in_w`, the dish's newest input power from the history buffer, and
-  `power_in_age_s`.
+  `power_in_age_s`; both are left out once two fetches in a row have been
+  missed.
 - **link** — ping drop rate and latency to the Starlink PoP, SNR flags.
 - **obstruction**, **thermal**, **alerts** — as reported by the dish.
-- **pointing** — the dish's own GPS fix (WARN with none) and satellite count,
-  tilt and attitude uncertainty. No thresholds on tilt yet.
+- **pointing** — the dish's own GPS fix (WARN with none, unless the dish
+  reports its GPS deliberately inhibited) and satellite count, tilt and
+  attitude uncertainty. No thresholds on tilt yet.
 - **comms** — whether the node is reaching the dish.
 
 ## Telemetry topics

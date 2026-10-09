@@ -298,13 +298,16 @@ def diagnose_pointing(status: dict) -> tuple[int, str]:
     """
     Diagnose the dish's own GPS fix, and report its tilt.
 
-    WARN when the dish reports no GPS fix. Tilt and attitude uncertainty are
+    WARN when the dish reports no GPS fix, unless its GPS is deliberately
+    inhibited (``inhibit_gps``). Tilt and attitude uncertainty are
     reported without thresholds until logs show what normal looks like.
     """
     gps = status.get('gps_stats')
     level = DiagnosticStatus.OK
     bits: list[str] = []
-    if isinstance(gps, dict) and 'gps_valid' in gps:
+    if isinstance(gps, dict) and gps.get('inhibit_gps'):
+        bits.append('dish GPS inhibited')
+    elif isinstance(gps, dict) and 'gps_valid' in gps:
         if gps.get('gps_valid'):
             sats = gps.get('gps_sats')
             bits.append(f'GPS fix ({sats} sats)' if sats is not None else 'GPS fix')
@@ -317,14 +320,18 @@ def diagnose_pointing(status: dict) -> tuple[int, str]:
     return level, ', '.join(bits) if bits else 'GPS and pointing data unavailable'
 
 
-def latest_history_value(history: Optional[dict], field: str) -> Optional[float]:
+def latest_history_value(
+    history: Optional[dict], field: str, max_back: int = 10,
+) -> Optional[float]:
     """
-    Return the newest sample of ``field`` from a ``dish_get_history`` dict.
+    Return the newest numeric sample of ``field`` from a ``dish_get_history`` dict.
 
     The history arrays are a ring buffer; ``current`` counts samples written
     so far, so the newest one is at ``(current - 1) % len(array)``. (That
     reading of ``current`` follows community tools and is unverified against
-    this firmware.) Returns None when the field or counter is missing.
+    this firmware.) A sample MessageToDict rendered as a string ('NaN') is
+    skipped, looking back at most ``max_back`` samples. Returns None when the
+    field or counter is missing or no recent sample is numeric.
     """
     if not isinstance(history, dict):
         return None
@@ -335,8 +342,11 @@ def latest_history_value(history: Optional[dict], field: str) -> Optional[float]
         return None
     if not isinstance(values, list) or not values or current <= 0:
         return None
-    value = values[(current - 1) % len(values)]
-    return float(value) if isinstance(value, (int, float)) else None
+    for back in range(min(max_back, current, len(values))):
+        value = values[(current - 1 - back) % len(values)]
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+    return None
 
 
 def diagnose_thermal(status: dict) -> tuple[int, str]:
