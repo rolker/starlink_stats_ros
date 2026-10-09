@@ -84,6 +84,7 @@ def build_fds(with_history: bool = True, extra_status_field: str = '') -> bytes:
     ])
     _msg(fdp, 'DishGpsStats', [
         ('gps_valid', b, opt, None), ('gps_sats', u32, opt, None),
+        ('inhibit_gps', b, opt, None),
     ])
     _msg(fdp, 'AlignmentStats', [
         ('tilt_angle_deg', flt, opt, None),
@@ -196,8 +197,8 @@ class FakeDish:
     Serve the fake schema on 127.0.0.1 with reflection and Device.Handle.
 
     ``status`` and ``history`` are dicts the test can replace at any time;
-    ``fail`` makes Handle abort with UNAVAILABLE. ``requests`` counts calls
-    by request kind.
+    ``fail`` makes every Handle call abort with UNAVAILABLE, ``fail_history``
+    only the history calls. ``requests`` counts calls by request kind.
     """
 
     def __init__(self, fds_bytes: bytes | None = None):
@@ -205,6 +206,7 @@ class FakeDish:
         self.status = default_status()
         self.history = default_history()
         self.fail = False
+        self.fail_history = False
         self.requests: dict[str, int] = {}
         self._server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
         self._server.add_generic_rpc_handlers((self._handler(),))
@@ -239,7 +241,7 @@ class FakeDish:
         request = self._req_cls.FromString(request_bytes)
         kind = request.WhichOneof('request')
         self.requests[kind] = self.requests.get(kind, 0) + 1
-        if self.fail:
+        if self.fail or (self.fail_history and kind == 'get_history'):
             context.abort(grpc.StatusCode.UNAVAILABLE, 'fake dish offline')
         if kind == 'get_status':
             body = {'dish_get_status': self.status}

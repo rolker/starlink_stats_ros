@@ -25,6 +25,7 @@ from rclpy.executors import SingleThreadedExecutor
 from rclpy.parameter import Parameter
 
 from starlink_stats import grpc_reflection
+from starlink_stats import starlink_diagnostics_node
 from starlink_stats.starlink_diagnostics_node import StarlinkDiagnosticsNode
 from std_msgs.msg import String
 
@@ -214,5 +215,52 @@ def test_unreachable_dish_publishes_no_telemetry(ros, dish):
             lambda: 'comms' in h.diag
             and h.diag['comms'].level == DiagnosticStatus.ERROR)
         assert h.status_json == [] and h.history_json == []
+    finally:
+        h.close()
+
+
+def test_history_period_zero_disables_history(ros, dish):
+    h = Harness(dish, publish_telemetry=True, history_period_sec=0.0)
+    try:
+        assert h.spin_until(lambda: len(h.status_json) > 5)
+        assert 'get_history' not in dish.requests
+        assert h.kv('state', 'power_in_w') is None
+    finally:
+        h.close()
+
+
+def test_history_waits_while_the_dish_is_unreachable(ros, dish):
+    h = Harness(dish, publish_telemetry=True)
+    try:
+        assert h.spin_until(lambda: h.history_json)
+        h.node.history_period_sec = 0.5  # make the next fetch due quickly
+        h.node._history_due_monotonic = 0.0
+        dish.fail = True
+        assert h.spin_until(lambda: h.diag.get('comms') is not None
+                            and h.diag['comms'].level == DiagnosticStatus.ERROR)
+        during = dish.requests.get('get_history', 0)
+        h.spin_until(lambda: False, timeout=1.5)
+        assert dish.requests.get('get_history', 0) == during
+        dish.fail = False
+        assert h.spin_until(lambda: dish.requests.get('get_history', 0) > during,
+                            timeout=15.0)
+    finally:
+        h.close()
+
+
+def test_failed_history_is_retried_and_stale_power_is_dropped(ros, dish, monkeypatch):
+    monkeypatch.setattr(starlink_diagnostics_node, '_HISTORY_RETRY_SEC', 0.3)
+    h = Harness(dish, history_period_sec=1.0)
+    try:
+        assert h.spin_until(lambda: h.kv('state', 'power_in_w') == '77.5')
+        dish.fail_history = True
+        first = dish.requests.get('get_history', 0)
+        # Retried after each failure...
+        assert h.spin_until(lambda: dish.requests.get('get_history', 0) >= first + 3)
+        # ...and once two periods pass without a fetch, the value is dropped.
+        assert h.spin_until(lambda: h.kv('state', 'power_in_w') is None
+                            and h.diag['state'].level == DiagnosticStatus.OK)
+        dish.fail_history = False
+        assert h.spin_until(lambda: h.kv('state', 'power_in_w') == '77.5')
     finally:
         h.close()

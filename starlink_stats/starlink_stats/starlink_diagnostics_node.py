@@ -67,6 +67,10 @@ class HistoryUnsupported(Exception):
     """The dish's reflected schema has no get_history request."""
 
 
+class HistoryDeferred(Exception):
+    """The last status poll failed; don't spend the worker on history."""
+
+
 def telemetry_json(response: dict, query_time_utc: str) -> str:
     """
     Wrap a full dish response for the telemetry topics.
@@ -308,6 +312,7 @@ class StarlinkDiagnosticsNode(Node):
             self.history_period_sec <= 0
             or self._history_unsupported
             or cache.status is None
+            or cache.error_message is not None
             or now_mono < self._history_due_monotonic
         ):
             return
@@ -363,6 +368,10 @@ class StarlinkDiagnosticsNode(Node):
 
     def _blocking_history(self) -> tuple[dict, float, str]:
         """Fetch the dish's history buffer. Runs on the gRPC worker thread."""
+        # A status poll that failed on the tick this was queued has already
+        # swapped the cache (its callback ran first on this worker).
+        if self._cache.error_message is not None:
+            raise HistoryDeferred()
         caller = self._ensure_device_caller()
         if not caller.supports('get_history'):
             raise HistoryUnsupported()
@@ -378,6 +387,8 @@ class StarlinkDiagnosticsNode(Node):
                 full, now_mono, now_iso = future.result()
             except CancelledError:
                 return  # node shutting down
+            except HistoryDeferred:
+                return  # due time unchanged: retried once status recovers
             except HistoryUnsupported:
                 self._history_unsupported = True
                 self.get_logger().warning(
@@ -396,11 +407,21 @@ class StarlinkDiagnosticsNode(Node):
                 power_in_w=latest_history_value(history, 'power_in'),
                 fetch_monotonic=now_mono,
             )
-            if self._history_pub is not None:
-                self._history_pub.publish(String(data=telemetry_json(full, now_iso)))
+            self._publish_telemetry(self._history_pub, full, now_iso)
         finally:
             with self._poll_lock:
                 self._history_in_flight = False
+
+    def _publish_telemetry(self, publisher, response: dict, query_time_utc: str):
+        """Publish one telemetry message; a failure is logged, never raised."""
+        if publisher is None:
+            return
+        try:
+            publisher.publish(String(data=telemetry_json(response, query_time_utc)))
+        except Exception as exc:  # e.g. publishing during shutdown
+            self.get_logger().warning(
+                f'Starlink telemetry publish failed: {exc!r}',
+                throttle_duration_sec=60.0)
 
     def _handle_poll_result(self, future: Future):
         """Done-callback on the gRPC worker thread. Swaps the cache atomically."""
@@ -465,8 +486,7 @@ class StarlinkDiagnosticsNode(Node):
                 error_message=None,
                 first_searching_monotonic=first_search,
             )
-            if self._status_pub is not None:
-                self._status_pub.publish(String(data=telemetry_json(full, now_iso)))
+            self._publish_telemetry(self._status_pub, full, now_iso)
 
             # --- Schema fingerprint and firmware change detection ---
             if isinstance(status, dict):
@@ -523,7 +543,11 @@ class StarlinkDiagnosticsNode(Node):
                         if self._cached_fds is not None:
                             save_cached_fds(self._cached_fds, sw)
                     self._known_firmware = sw
-                elif self._fds_needs_save and self._cached_fds is not None:
+                elif (
+                    self._fds_needs_save
+                    and self._cached_fds is not None
+                    and sw != '?'
+                ):
                     # Post-re-reflection: freshly reflected descriptors are
                     # now in _cached_fds — persist them under the current
                     # firmware version.
@@ -653,9 +677,12 @@ class StarlinkDiagnosticsNode(Node):
         self._apply_common_kv(stat, cache, 'state')
         history = self._history
         if history.power_in_w is not None:
-            stat.add('power_in_w', f'{history.power_in_w:.1f}')
-            stat.add('power_in_age_s',
-                     f'{time.monotonic() - history.fetch_monotonic:.0f}')
+            age = time.monotonic() - history.fetch_monotonic
+            # Two missed fetches: drop the value rather than show an old
+            # one beside a current state.
+            if age <= 2.0 * self.history_period_sec:
+                stat.add('power_in_w', f'{history.power_in_w:.1f}')
+                stat.add('power_in_age_s', f'{age:.0f}')
         return stat
 
     def _task_link(self, stat):
